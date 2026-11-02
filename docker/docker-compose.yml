@@ -9,8 +9,6 @@ services:
     volumes:
       # Reuse the host's Antigravity authentication session
       - ${HOME}/.gemini:/root/.gemini
-      # Mount source for local development
-      - ../src:/app/src
       # Persist uploaded files
       - ../uploads:/app/uploads
     env_file:

@@ -1,11 +1,12 @@
 # agy-wrapper-service
 
-A generic HTTP wrapper for the Google Antigravity CLI (`agy`), with an optional `ask` command-line client. It accepts prompts and uploaded files without bundling domain-specific workflows.
+A generic HTTP wrapper for the Google Antigravity CLI (`agy`), written in Go, with an optional `ask` command-line client. It accepts prompts and uploaded files without bundling domain-specific workflows.
 
 ## Requirements
 
 - Docker and Docker Compose
-- Node.js 20+ to run outside Docker
+- Go 1.27.3+ to run the API outside Docker
+- Node.js 24+ only if the `companion-for-agy` fallback is needed
 - Antigravity CLI installed and authenticated, or a mounted `~/.gemini` session when using Docker
 
 ## Configure and run
@@ -17,7 +18,9 @@ cp .env.example .env
 docker compose -f docker/docker-compose.yml up -d --build
 ```
 
-The API listens on port `3000` by default. The Compose service mounts the host's `~/.gemini` directory so `agy` can use its existing session. The `ask` client defaults to `http://localhost:3000`; use `ask set-url <url>` to point it elsewhere.
+The API listens on port `3000` by default. The Compose service mounts the host's `~/.gemini` directory so `agy` can use its existing session. The Go server is compiled into the image. Node.js is retained only to run the optional `companion-for-agy` fallback when the native `agy` command fails. The `ask` client defaults to `http://localhost:3000`; use `ask set-url <url>` to point it elsewhere.
+
+To run the API directly on a machine with Go and `agy` installed, run `go run .` from the repository root. Run `npm ci` only if you also want the optional Node.js fallback.
 
 ## API
 

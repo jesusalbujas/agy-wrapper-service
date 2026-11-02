@@ -1,15 +1,14 @@
 {
   "name": "agy-cli-wrapper",
   "version": "1.0.0",
-  "description": "API Wrapper for Antigravity CLI",
-  "main": "index.js",
+  "description": "Optional companion-for-agy fallback for the Go Antigravity CLI wrapper",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "go run ."
   },
   "dependencies": {
-    "companion-for-agy": "^2.0.2",
-    "dotenv": "^17.4.2",
-    "express": "^4.19.2",
-    "multer": "^1.4.5-lts.1"
+    "companion-for-agy": "^2.0.2"
+  },
+  "allowScripts": {
+    "node-pty@1.1.0": true
   }
 }

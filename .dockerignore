@@ -1,5 +1,3 @@
-node_modules
-npm-debug.log
 .git
 .env
 .env.*
@@ -7,11 +5,12 @@ npm-debug.log
 docker/.env
 **/antigravity-oauth-token
 **/auth.json
+node_modules
 uploads/*
 !uploads/.gitkeep
 resources/*
 !resources/.gitkeep
-scratch/
+scratch
 *.log
 *.sqlite
 *.db
