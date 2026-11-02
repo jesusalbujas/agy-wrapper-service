@@ -44,3 +44,7 @@ curl -sS -X POST http://localhost:3000/ask \
 The API has no built-in request authentication and runs Antigravity with automatic tool approval. Keep it on a trusted private network; do not publish the port directly to the internet. Only mount directories the service needs.
 
 Local `.env` files, Antigravity credentials, uploads, and scratch data are excluded from Git and the Docker build context. Use `.env.example` as the safe configuration template.
+
+## Terms and Conditions
+
+This is a non-profit community project, from the community for the community. Read the [Terms and Conditions](TERMS_AND_CONDITIONS.md) before using or operating an instance. Third-party services and self-hosted deployments may have separate costs and requirements.
