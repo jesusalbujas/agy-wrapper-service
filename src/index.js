@@ -9,7 +9,7 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Asegurar que las rutas de agy estén en PATH
+// Ensure agy is available on PATH
 const homedir = process.env.HOME || '/root';
 const extraPaths = [
   path.join(homedir, '.local', 'bin'),
@@ -22,7 +22,7 @@ for (const p of extraPaths) {
   }
 }
 
-// Configuración para subida de archivos (/app/uploads)
+// File upload configuration (/app/uploads)
 const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, '../uploads');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
@@ -40,12 +40,12 @@ const upload = multer({ storage });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Helper para encontrar el directorio de configuración de Gemini / Antigravity
+// Find the Gemini / Antigravity configuration directory
 function getGeminiDir() {
   return process.env.GEMINI_DIR || path.join(process.env.HOME || '/root', '.gemini');
 }
 
-// Helper para extraer los pensamientos (Thinking) del transcript de una conversación
+// Extract thinking entries from a conversation transcript
 function getThinkingFromTranscript(conversationId) {
   if (!conversationId) return null;
   try {
@@ -70,7 +70,7 @@ function getThinkingFromTranscript(conversationId) {
   }
 }
 
-// Helper para extraer las acciones de herramientas ejecutadas
+// Extract tool actions from a conversation transcript
 function getToolActionsFromTranscript(conversationId) {
   if (!conversationId) return [];
   try {
@@ -97,32 +97,32 @@ function getToolActionsFromTranscript(conversationId) {
   }
 }
 
-// Helper para encontrar el binario de agy
+// Find the agy executable
 function getAgyExecutable() {
   const candidate = process.env.AGY_PATH || '/root/.local/bin/agy';
   if (fs.existsSync(candidate)) return candidate;
   return 'agy';
 }
 
-// Normalizar el nivel de razonamiento (effort / level)
+// Normalize reasoning effort (effort / level)
 function normalizeLevel(level) {
   if (!level) return null;
   const str = String(level).trim().toLowerCase();
-  if (['low', 'bajo', '1'].includes(str)) return 'low';
-  if (['medium', 'medio', 'med', '2'].includes(str)) return 'medium';
-  if (['high', 'alto', '3'].includes(str)) return 'high';
-  if (['none', 'off', 'ninguno', '0'].includes(str)) return null;
+  if (['low', '1'].includes(str)) return 'low';
+  if (['medium', 'med', '2'].includes(str)) return 'medium';
+  if (['high', '3'].includes(str)) return 'high';
+  if (['none', 'off', '0'].includes(str)) return null;
   return str;
 }
 
-// Resolver modelo y nivel con sus valores por defecto
+// Resolve model and effort defaults
 function resolveModelAndLevel(req) {
   const model = req.body?.model || req.query?.model || process.env.DEFAULT_MODEL || process.env.AGY_MODEL || 'gemini-3.8-flash';
   const defaultEffort = process.env.DEFAULT_LEVEL || process.env.DEFAULT_EFFORT || 'medium';
   const rawLevel = req.body?.level || req.body?.effort || req.query?.level || req.query?.effort;
   let effort = normalizeLevel(rawLevel);
 
-  // Modelos tipo flash/pro requieren --effort en la CLI si no está en el nombre
+  // Flash and Pro models require --effort unless the model name already includes it
   if (!effort && !model.endsWith('-low') && !model.endsWith('-medium') && !model.endsWith('-high') && !model.startsWith('claude')) {
     effort = normalizeLevel(defaultEffort) || 'medium';
   }
@@ -130,7 +130,7 @@ function resolveModelAndLevel(req) {
   return { model, effort };
 }
 
-// Ejecutar agy directamente en modo batch (no-streaming)
+// Run agy directly in batch mode (non-streaming)
 function runNativeAgy({ query, model, effort, workspaceDir, continueSession, conversationId }) {
   return new Promise((resolve, reject) => {
     const agyBin = getAgyExecutable();
@@ -178,7 +178,7 @@ function runNativeAgy({ query, model, effort, workspaceDir, continueSession, con
   });
 }
 
-// Fallback usando companion-for-agy por si agy nativo no estuviese disponible
+// Use companion-for-agy if the native agy executable is unavailable
 function runCompanionFallback({ query, model, effort, workspaceDir }) {
   return new Promise((resolve, reject) => {
     const safeQuery = query.replace(/"/g, '\\"');
@@ -203,17 +203,17 @@ function runCompanionFallback({ query, model, effort, workspaceDir }) {
   });
 }
 
-// Ejecución con fallback
+// Execute with fallback
 async function executeAgy(params) {
   try {
     return await runNativeAgy(params);
   } catch (nativeErr) {
-    console.warn(`[!] agy nativo falló (${nativeErr.message}), intentando fallback con companion-for-agy...`);
+    console.warn(`[!] Native agy failed (${nativeErr.message}); trying the companion-for-agy fallback...`);
     return await runCompanionFallback(params);
   }
 }
 
-// Ejecutar agy en modo STREAMING (SSE o chunked text)
+// Run agy in streaming mode (SSE or chunked text)
 function streamAgy({ query, model, effort, workspaceDir, continueSession, conversationId, res, req }) {
   const agyBin = getAgyExecutable();
   const args = [
@@ -267,7 +267,7 @@ function streamAgy({ query, model, effort, workspaceDir, continueSession, conver
             if (isSse) {
               res.write(`data: ${JSON.stringify({ type: 'thinking', text: thinkingText })}\n\n`);
             } else {
-              res.write(`\n💭 [Pensamiento]:\n${thinkingText}\n\n`);
+              res.write(`\n💭 [Thoughts]:\n${thinkingText}\n\n`);
             }
           }
         } catch (e) {}
@@ -275,11 +275,11 @@ function streamAgy({ query, model, effort, workspaceDir, continueSession, conver
     } catch (e) {}
   }
 
-  // Cancelar proceso de agy si el cliente corta la conexión HTTP prematuramente
+  // Stop agy if the client closes the HTTP connection prematurely
   res.on('close', () => {
     if (transcriptInterval) clearInterval(transcriptInterval);
     if (!res.writableEnded && !child.killed) {
-      console.log('[-] Cliente desconectado prematuramente. Terminando proceso de agy.');
+      console.log('[-] Client disconnected prematurely. Stopping the agy process.');
       child.kill('SIGTERM');
     }
   });
@@ -299,15 +299,15 @@ function streamAgy({ query, model, effort, workspaceDir, continueSession, conver
       } else if (data.event === 'step_update' && data.step_update) {
         const step = data.step_update;
 
-        // Herramientas / Acciones en curso
+        // Active tools / actions
         if (step.step_type === 'tool' && step.state === 'ACTIVE') {
-          const toolName = step.tool_name || step.tool_info?.name || 'herramienta';
+          const toolName = step.tool_name || step.tool_info?.name || 'tool';
           const cmd = step.tool_info?.parameters?.CommandLine;
           const paramStr = cmd ? ` -> ${cmd}` : '';
           if (isSse) {
             res.write(`data: ${JSON.stringify({ type: 'tool', tool: toolName, params: step.tool_info?.parameters })}\n\n`);
           } else {
-            res.write(`\n⚡ [Acción: ${toolName}${paramStr}]\n`);
+            res.write(`\n⚡ [Action: ${toolName}${paramStr}]\n`);
           }
         } else if (step.step_type === 'agent_response' && step.text_delta) {
           const delta = step.text_delta;
@@ -324,13 +324,13 @@ function streamAgy({ query, model, effort, workspaceDir, continueSession, conver
         }
       }
     } catch (e) {
-      // Línea no parseable o texto plano auxiliar
+      // Ignore unparseable lines and auxiliary plain text
     }
   });
 
   child.stderr.on('data', (data) => {
     const errText = data.toString();
-    // Filtrar mensajes informativos de inicio si los hubiera
+    // Filter startup notices, if present
     if (!errText.includes('Fetching available models')) {
       console.error(`[agy stderr]: ${errText}`);
     }
@@ -340,7 +340,7 @@ function streamAgy({ query, model, effort, workspaceDir, continueSession, conver
     if (transcriptInterval) clearInterval(transcriptInterval);
     checkTranscript();
     if (code !== 0 && !res.headersSent) {
-      res.status(500).send(`Error en agy (código ${code})`);
+      res.status(500).send(`agy failed (exit code ${code})`);
     } else {
       res.end();
     }
@@ -348,16 +348,16 @@ function streamAgy({ query, model, effort, workspaceDir, continueSession, conver
 
   child.on('error', (err) => {
     if (transcriptInterval) clearInterval(transcriptInterval);
-    console.error(`[-] Error al iniciar agy: ${err.message}`);
+    console.error(`[-] Failed to start agy: ${err.message}`);
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Error al iniciar agy', details: err.message });
+      res.status(500).json({ error: 'Failed to start agy', details: err.message });
     } else {
       res.end();
     }
   });
 }
 
-// Despachar respuesta (texto puro por defecto, o JSON si fue solicitado)
+// Send a plain-text response by default, or JSON when requested
 function formatResponse(req, res, result, model, effort) {
   const convId = result.meta?.conversation_id;
   if (convId) {
@@ -389,23 +389,23 @@ function formatResponse(req, res, result, model, effort) {
     });
   }
 
-  // Si se solicitó ver el pensamiento en modo texto y existe
+  // Include thinking in the text response when requested and available
   if (showThinking && result.thinking) {
-    return res.type('text/plain; charset=utf-8').send(`💭 [Pensamiento]:\n${result.thinking}\n\n${result.response}`);
+    return res.type('text/plain; charset=utf-8').send(`💭 [Thoughts]:\n${result.thinking}\n\n${result.response}`);
   }
 
-  // Por defecto: responder solo el contenido puro del response en texto
+  // Return only the response text by default
   res.type('text/plain; charset=utf-8').send(result.response);
 }
 
 // ==============================================================================
-// 1. ENDPOINT GENERAL /ask (Soporta streaming con stream: true o Accept: text/event-stream)
+// 1. GENERAL /ask ENDPOINT (supports stream: true or Accept: text/event-stream)
 // ==============================================================================
 app.post('/ask', async (req, res) => {
   const query = req.body?.query;
 
   if (!query) {
-    return res.status(400).json({ error: 'El campo "query" es requerido' });
+    return res.status(400).json({ error: 'The "query" field is required' });
   }
 
   const { model, effort } = resolveModelAndLevel(req);
@@ -413,7 +413,7 @@ app.post('/ask', async (req, res) => {
   const continueSession = req.body?.continue === true || req.body?.c === true || req.query?.continue === 'true';
   const conversationId = req.body?.conversation_id || req.body?.conversation || req.query?.conversation_id;
 
-  console.log(`[+] /ask: "${query.substring(0, 80)}..." | Modelo: ${model} | Nivel: ${effort || 'default'} | Stream: ${wantsStream} | Continue: ${continueSession}`);
+  console.log(`[+] /ask: "${query.substring(0, 80)}..." | Model: ${model} | Effort: ${effort || 'default'} | Stream: ${wantsStream} | Continue: ${continueSession}`);
 
   if (wantsStream) {
     return streamAgy({
@@ -439,32 +439,32 @@ app.post('/ask', async (req, res) => {
     });
     formatResponse(req, res, result, model, effort);
   } catch (error) {
-    console.error(`[-] Error en /ask: ${error.message}`);
+    console.error(`[-] Error in /ask: ${error.message}`);
     res.status(500).json({
-      error: 'Ocurrió un error al ejecutar la CLI de Antigravity.',
+      error: 'An error occurred while running the Antigravity CLI.',
       details: error.message
     });
   }
 });
 
-// Endpoint dedicado para streaming GET o POST
+// Streaming endpoint for GET and POST requests
 app.get('/ask/stream', (req, res) => {
   const query = req.query.query;
-  if (!query) return res.status(400).send('Falta el parámetro "query"');
+  if (!query) return res.status(400).send('The "query" parameter is required');
   const { model, effort } = resolveModelAndLevel(req);
   streamAgy({ query, model, effort, workspaceDir: '/app', res, req });
 });
 
 app.post('/ask/stream', (req, res) => {
   const query = req.body?.query;
-  if (!query) return res.status(400).send('Falta el campo "query"');
+  if (!query) return res.status(400).send('The "query" field is required');
   const { model, effort } = resolveModelAndLevel(req);
   streamAgy({ query, model, effort, workspaceDir: req.body?.workspaceDir || '/app', res, req });
 });
 
 // ==============================================================================
-// 2. ENDPOINT PARA ANÁLISIS DE ARCHIVOS (/ask-file)
-//    Soporta subida de archivos (multipart/form-data) o ruta existente en /app
+// 2. FILE ANALYSIS ENDPOINT (/ask-file)
+//    Supports multipart/form-data uploads or an existing path in /app
 // ==============================================================================
 app.post('/ask-file', upload.single('file'), async (req, res) => {
   let targetFilePath = '';
@@ -480,20 +480,20 @@ app.post('/ask-file', upload.single('file'), async (req, res) => {
     originalName = path.basename(targetFilePath);
 
     if (!fs.existsSync(targetFilePath)) {
-      return res.status(404).json({ error: `El archivo no existe en: ${targetFilePath}` });
+      return res.status(404).json({ error: `File not found: ${targetFilePath}` });
     }
   } else {
     return res.status(400).json({
-      error: 'Debes adjuntar un archivo ("file") o especificar una ruta existente ("filePath")'
+      error: 'Attach a file ("file") or specify an existing path ("filePath")'
     });
   }
 
-  const userInstruction = req.body?.query || req.body?.instruction || 'Analiza detalladamente este archivo, explica qué hace y destaca posibles problemas o mejoras.';
+  const userInstruction = req.body?.query || req.body?.instruction || 'Analyze this file in detail, explain what it does, and highlight potential issues or improvements.';
   const { model, effort } = resolveModelAndLevel(req);
 
-  const fullPrompt = `Instrucción: ${userInstruction}\nArchivo a inspeccionar: "${targetFilePath}" (Nombre original: "${originalName}").\nPor favor lee el archivo y responde a la instrucción.`;
+  const fullPrompt = `Instruction: ${userInstruction}\nFile to inspect: "${targetFilePath}" (original name: "${originalName}").\nRead the file and respond to the instruction.`;
 
-  console.log(`[+] /ask-file: Archivo "${originalName}" | Instrucción: "${userInstruction.substring(0, 60)}..."`);
+  console.log(`[+] /ask-file: File "${originalName}" | Instruction: "${userInstruction.substring(0, 60)}..."`);
 
   const wantsStream = req.body?.stream === true || req.query?.stream === 'true' || req.headers.accept === 'text/event-stream';
   if (wantsStream) {
@@ -509,19 +509,19 @@ app.post('/ask-file', upload.single('file'), async (req, res) => {
     });
     formatResponse(req, res, result, model, effort);
   } catch (error) {
-    console.error(`[-] Error en /ask-file: ${error.message}`);
-    res.status(500).json({ error: 'Error al analizar el archivo', details: error.message });
+    console.error(`[-] Error in /ask-file: ${error.message}`);
+    res.status(500).json({ error: 'Failed to analyze the file', details: error.message });
   }
 });
 
 // ==============================================================================
-// 3. UTILITIES AND METADATA (Modelos, Salud, Raíz)
+// 3. UTILITIES AND METADATA (models, health, root)
 // ==============================================================================
 app.get('/models', (req, res) => {
   const agyBin = getAgyExecutable();
   execFile(agyBin, ['models'], { env: process.env }, (err, stdout, stderr) => {
     if (err) {
-      return res.status(500).json({ error: 'Error al obtener modelos', details: stderr });
+      return res.status(500).json({ error: 'Failed to retrieve models', details: stderr });
     }
 
     const lines = stdout.split('\n')
@@ -560,7 +560,7 @@ app.get('/', (req, res) => {
     endpoints: {
       ask: 'POST /ask (body: { query, model?, level?, stream?, json? })',
       stream: 'GET|POST /ask/stream (query/body: { query, model?, level? })',
-      askFile: 'POST /ask-file (multipart "file" o body: { filePath, query })',
+      askFile: 'POST /ask-file (multipart "file" or body: { filePath, query })',
       models: 'GET /models',
       health: 'GET /health'
     }
