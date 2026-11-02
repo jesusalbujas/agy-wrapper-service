@@ -1,0 +1,15 @@
+{
+  "name": "agy-cli-wrapper",
+  "version": "1.0.0",
+  "description": "API Wrapper for Antigravity CLI",
+  "main": "index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "companion-for-agy": "^2.0.2",
+    "dotenv": "^17.4.2",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}

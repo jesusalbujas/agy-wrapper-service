@@ -1,0 +1,22 @@
+services:
+  agy-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: agy-api-wrapper
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+    volumes:
+      # Reuse the host's Antigravity authentication session
+      - ${HOME}/.gemini:/root/.gemini
+      # Mount source for local development
+      - ../src:/app/src
+      # Persist uploaded files
+      - ../uploads:/app/uploads
+    env_file:
+      - ../.env
+    environment:
+      PORT: ${PORT:-3000}
+      UPLOAD_DIR: ${UPLOAD_DIR:-/app/uploads}
+      AGY_PATH: ${AGY_PATH:-/root/.local/bin/agy}
+    restart: unless-stopped

@@ -1,0 +1,636 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# ask - CLI Client para agy-cli wrapper API
+# Compatible con Zsh, Bash, Dash y cualquier terminal POSIX
+# ==============================================================================
+
+CONFIG_URL_FILE="${HOME}/.gemini/antigravity-cli/api_url"
+API_BASE=""
+if [ -f "$CONFIG_URL_FILE" ]; then
+    SAVED_URL=$(cat "$CONFIG_URL_FILE" 2>/dev/null | tr -d '\r\n')
+    if [ -n "$SAVED_URL" ]; then
+        API_BASE="$SAVED_URL"
+    fi
+fi
+API_BASE="${AGY_API_URL:-${API_BASE:-http://localhost:3000}}"
+MODEL=""
+LEVEL=""
+STREAM=false
+CONTINUE=false
+SHOW_THINKING=${ASK_SHOW_THINKING:-false}
+JSON_OUTPUT=false
+RAW_OUTPUT=false
+QUERY_PARTS=()
+
+TOKEN_DIR="${HOME}/.gemini/antigravity-cli"
+TOKEN_FILE="${TOKEN_DIR}/antigravity-oauth-token"
+CONTAINER_NAME="agy-api-wrapper"
+DEFAULT_IMPALA_HOST="impala@20.12.0.2"
+
+handle_set_url() {
+    local new_url="$1"
+    if [ -z "$new_url" ]; then
+        echo -e "${COLOR_RED}[ERROR] Debes especificar la URL del endpoint.${COLOR_RESET}" >&2
+        echo "Uso: ask set-url <url>" >&2
+        echo "Ejemplo: ask set-url http://20.12.0.2:3000" >&2
+        echo "Para volver al valor local: ask set-url local" >&2
+        exit 1
+    fi
+
+    if [ "$new_url" = "local" ] || [ "$new_url" = "default" ] || [ "$new_url" = "reset" ]; then
+        rm -f "$CONFIG_URL_FILE"
+        echo -e "${COLOR_GREEN}[OK] Endpoint restablecido a local: http://localhost:3000${COLOR_RESET}"
+        exit 0
+    fi
+
+    new_url="${new_url%/}"
+    mkdir -p "$(dirname "$CONFIG_URL_FILE")"
+    echo "$new_url" > "$CONFIG_URL_FILE"
+    echo -e "${COLOR_GREEN}[OK] Endpoint de red configurado exitosamente:${COLOR_RESET}"
+    echo -e "    ${COLOR_BOLD}${new_url}${COLOR_RESET}"
+    echo ""
+    echo -n "Probando conectividad con el servidor... "
+    if curl -s --connect-timeout 3 "${new_url}/health" >/dev/null 2>&1; then
+        echo -e "${COLOR_GREEN}[CONECTADO]${COLOR_RESET}"
+        echo -e "El CLI ahora se comunicará de forma remota con este endpoint."
+    else
+        echo -e "${COLOR_YELLOW}[AVISO] No se pudo conectar inmediatamente.${COLOR_RESET}"
+        echo "Verifica que el contenedor esté corriendo y accesible en ese puerto/IP."
+    fi
+    exit 0
+}
+
+handle_get_url() {
+    echo -e "Endpoint actual de ask: ${COLOR_CYAN}${COLOR_BOLD}${API_BASE}${COLOR_RESET}"
+    if [ -f "$CONFIG_URL_FILE" ]; then
+        echo -e "(Configurado permanentemente en: $CONFIG_URL_FILE)"
+    else
+        echo -e "(Valor por defecto: http://localhost:3000)"
+    fi
+    exit 0
+}
+
+# Colores para salida de terminal
+COLOR_GREEN='\033[0;32m'
+COLOR_BLUE='\033[0;34m'
+COLOR_YELLOW='\033[1;33m'
+COLOR_CYAN='\033[0;36m'
+COLOR_RED='\033[0;31m'
+COLOR_BOLD='\033[1m'
+COLOR_RESET='\033[0m'
+
+get_token_info() {
+    if [ ! -f "$TOKEN_FILE" ]; then
+        return 1
+    fi
+    python3 -c '
+import json, base64, sys
+
+token_file = sys.argv[1]
+try:
+    with open(token_file) as f:
+        data = json.load(f)
+    
+    id_token = data.get("id_token", "")
+    email = "Desconocido"
+    name = "Desconocido"
+    if id_token and "." in id_token:
+        parts = id_token.split(".")
+        if len(parts) >= 2:
+            payload = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            email = claims.get("email", "Desconocido")
+            name = claims.get("name", "Desconocido")
+    
+    expiry_str = data.get("token", {}).get("expiry", "Sin fecha")
+    method = data.get("auth_method", "consumer")
+    has_refresh = "refresh_token" in data.get("token", {})
+    
+    print(f"NAME={name}")
+    print(f"EMAIL={email}")
+    print(f"EXPIRY={expiry_str}")
+    print(f"METHOD={method}")
+    print(f"HAS_REFRESH={has_refresh}")
+except Exception:
+    sys.exit(1)
+' "$TOKEN_FILE" 2>/dev/null
+}
+
+handle_auth_status() {
+    echo -e "${COLOR_BLUE}==========================================================${COLOR_RESET}"
+    echo -e "${COLOR_BLUE}     Antigravity CLI - Estado de Autenticación            ${COLOR_RESET}"
+    echo -e "${COLOR_BLUE}==========================================================${COLOR_RESET}"
+    
+    if [ ! -f "$TOKEN_FILE" ]; then
+        echo -e "${COLOR_YELLOW}[!] No se encontró ningún token activo en:${COLOR_RESET}"
+        echo -e "    $TOKEN_FILE"
+        echo ""
+        echo -e "Ejecuta ${COLOR_BOLD}ask login${COLOR_RESET} para iniciar sesión con tu cuenta de Google."
+        exit 1
+    fi
+
+    local info
+    info=$(get_token_info)
+    if [ $? -ne 0 ] || [ -z "$info" ]; then
+        echo -e "${COLOR_RED}[ERROR] El archivo de token está dañado o no es un JSON válido.${COLOR_RESET}"
+        echo -e "Ejecuta ${COLOR_BOLD}ask login${COLOR_RESET} para volver a generar las credenciales."
+        exit 1
+    fi
+
+    local token_name token_email token_expiry token_method token_refresh
+    token_name=$(echo "$info" | grep '^NAME=' | cut -d= -f2-)
+    token_email=$(echo "$info" | grep '^EMAIL=' | cut -d= -f2-)
+    token_expiry=$(echo "$info" | grep '^EXPIRY=' | cut -d= -f2-)
+    token_method=$(echo "$info" | grep '^METHOD=' | cut -d= -f2-)
+    token_refresh=$(echo "$info" | grep '^HAS_REFRESH=' | cut -d= -f2-)
+
+    echo -e "  ${COLOR_BOLD}Archivo:${COLOR_RESET}           $TOKEN_FILE"
+    echo -e "  ${COLOR_BOLD}Usuario:${COLOR_RESET}           ${COLOR_GREEN}${token_name}${COLOR_RESET}"
+    echo -e "  ${COLOR_BOLD}Correo:${COLOR_RESET}            ${COLOR_CYAN}${token_email}${COLOR_RESET}"
+    echo -e "  ${COLOR_BOLD}Método:${COLOR_RESET}            $token_method"
+    echo -e "  ${COLOR_BOLD}Expira:${COLOR_RESET}            $token_expiry"
+    echo -e "  ${COLOR_BOLD}Token Refresco:${COLOR_RESET}    $([ "$token_refresh" = "True" ] && echo -e "${COLOR_GREEN}Sí (renovación automática activa)${COLOR_RESET}" || echo -e "${COLOR_RED}No${COLOR_RESET}")"
+    echo ""
+
+    if command -v docker >/dev/null 2>&1; then
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+            echo -e "  ${COLOR_BOLD}Servicio local:${COLOR_RESET}    ${COLOR_GREEN}● En ejecución (${CONTAINER_NAME})${COLOR_RESET}"
+        elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+            echo -e "  ${COLOR_BOLD}Servicio local:${COLOR_RESET}    ${COLOR_YELLOW}○ Detenido (${CONTAINER_NAME})${COLOR_RESET}"
+        fi
+    fi
+    echo ""
+    exit 0
+}
+
+handle_auth_sync() {
+    local target="$1"
+    local remote_host=""
+
+    if [ -z "$target" ] || [ "$target" = "impala" ]; then
+        remote_host="$DEFAULT_IMPALA_HOST"
+    elif [[ "$target" == *"@"* ]]; then
+        remote_host="$target"
+    else
+        remote_host="erp@${target}"
+    fi
+
+    echo -e "${COLOR_BLUE}==========================================================${COLOR_RESET}"
+    echo -e "${COLOR_BLUE}    Sincronización de Autenticación -> ${remote_host}     ${COLOR_RESET}"
+    echo -e "${COLOR_BLUE}==========================================================${COLOR_RESET}"
+
+    if [ ! -f "$TOKEN_FILE" ] || [ ! -s "$TOKEN_FILE" ]; then
+        echo -e "${COLOR_RED}[ERROR] No existe un token de sesión local para sincronizar.${COLOR_RESET}"
+        echo -e "Ejecuta primero: ${COLOR_BOLD}ask login${COLOR_RESET}"
+        exit 1
+    fi
+
+    local info
+    info=$(get_token_info 2>/dev/null)
+    local sync_email
+    sync_email=$(echo "$info" | grep '^EMAIL=' | cut -d= -f2-)
+    echo -e "-> Enviando credenciales de: ${COLOR_CYAN}${sync_email}${COLOR_RESET}"
+
+    ssh -o ConnectTimeout=5 -o BatchMode=yes "${remote_host}" "mkdir -p ~/.gemini/antigravity-cli" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        echo -e "${COLOR_RED}[ERROR] No se pudo conectar mediante SSH a ${remote_host}.${COLOR_RESET}"
+        echo -e "Verifica tu conexión y llaves SSH."
+        exit 1
+    fi
+
+    scp -q -o ConnectTimeout=5 "$TOKEN_FILE" "${remote_host}:~/.gemini/antigravity-cli/antigravity-oauth-token"
+    if [ $? -ne 0 ]; then
+        echo -e "${COLOR_RED}[ERROR] Falló la copia del token hacia ${remote_host}.${COLOR_RESET}"
+        exit 1
+    fi
+    echo -e "${COLOR_GREEN}[OK] Token copiado a ${remote_host}:~/.gemini/antigravity-cli/antigravity-oauth-token${COLOR_RESET}"
+
+    echo -e "-> Reiniciando servicio API en ${remote_host}..."
+    ssh -o ConnectTimeout=5 -o BatchMode=yes "${remote_host}" "docker restart ${CONTAINER_NAME} 2>/dev/null || true" >/dev/null 2>&1
+    echo -e "${COLOR_GREEN}${COLOR_BOLD}[EXITO] Sesión sincronizada y activa en ${remote_host}.${COLOR_RESET}"
+    echo ""
+    exit 0
+}
+
+handle_login() {
+    echo -e "${COLOR_BLUE}==========================================================${COLOR_RESET}"
+    echo -e "${COLOR_BLUE}         Antigravity CLI - Inicio de Sesión Google        ${COLOR_RESET}"
+    echo -e "${COLOR_BLUE}==========================================================${COLOR_RESET}"
+
+    if [ ! -t 0 ]; then
+        echo -e "${COLOR_RED}[ERROR] El comando 'ask login' debe ejecutarse en una terminal interactiva.${COLOR_RESET}"
+        exit 1
+    fi
+
+    if [ -f "$TOKEN_FILE" ]; then
+        local current_info
+        current_info=$(get_token_info 2>/dev/null)
+        local cur_email cur_name
+        cur_email=$(echo "$current_info" | grep '^EMAIL=' | cut -d= -f2-)
+        cur_name=$(echo "$current_info" | grep '^NAME=' | cut -d= -f2-)
+        
+        if [ -n "$cur_email" ] && [ "$cur_email" != "Desconocido" ]; then
+            echo -e "${COLOR_YELLOW}[i] Ya existe una sesión activa como:${COLOR_RESET}"
+            echo -e "    ${COLOR_BOLD}${cur_name} <${cur_email}>${COLOR_RESET}"
+            echo ""
+            read -r -p "¿Deseas iniciar sesión nuevamente o cambiar de cuenta? [s/N]: " confirm
+            if [[ ! "$confirm" =~ ^[sS]$ ]]; then
+                echo -e "${COLOR_GREEN}[OK] Manteniendo la sesión actual.${COLOR_RESET}"
+                exit 0
+            fi
+            echo ""
+        fi
+        cp -f "$TOKEN_FILE" "${TOKEN_FILE}.bak"
+        rm -f "$TOKEN_FILE"
+    fi
+
+    echo -e "${COLOR_CYAN}-> Iniciando autenticación interactiva con Google...${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}Instrucciones:${COLOR_RESET}"
+    echo -e "  1. Visita el enlace que aparecerá a continuación en tu navegador."
+    echo -e "  2. Inicia sesión con tu cuenta de Google y autoriza la aplicación."
+    echo -e "  3. Copia el código de verificación resultante y pégalo aquí."
+    echo -e "${COLOR_BLUE}----------------------------------------------------------${COLOR_RESET}"
+    echo ""
+
+    if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+        docker exec -it "${CONTAINER_NAME}" /root/.local/bin/agy -p "auth-session-init" || true
+    elif command -v agy >/dev/null 2>&1; then
+        DBUS_SESSION_BUS_ADDRESS="" agy -p "auth-session-init" || true
+    else
+        echo -e "${COLOR_RED}[ERROR] No se encontró el binario 'agy' ni el contenedor Docker '${CONTAINER_NAME}'.${COLOR_RESET}"
+        if [ -f "${TOKEN_FILE}.bak" ]; then
+            mv -f "${TOKEN_FILE}.bak" "$TOKEN_FILE"
+        fi
+        exit 1
+    fi
+
+    echo ""
+    echo -e "${COLOR_BLUE}----------------------------------------------------------${COLOR_RESET}"
+
+    if [ -f "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ]; then
+        local new_info
+        new_info=$(get_token_info 2>/dev/null)
+        local new_email new_name
+        new_email=$(echo "$new_info" | grep '^EMAIL=' | cut -d= -f2-)
+        new_name=$(echo "$new_info" | grep '^NAME=' | cut -d= -f2-)
+
+        echo -e "${COLOR_GREEN}${COLOR_BOLD}[EXITO] ¡Sesión iniciada correctamente!${COLOR_RESET}"
+        if [ -n "$new_email" ]; then
+            echo -e "Conectado como: ${COLOR_CYAN}${new_name} <${new_email}>${COLOR_RESET}"
+        fi
+
+        if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+            echo -e "-> Reiniciando servicio API local (${CONTAINER_NAME})..."
+            docker restart "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+            echo -e "${COLOR_GREEN}[OK] Servicio API local actualizado.${COLOR_RESET}"
+        fi
+
+        echo ""
+        read -r -p "¿Deseas sincronizar esta sesión con el servidor remoto impala (20.12.0.2)? [s/N]: " sync_confirm
+        if [[ "$sync_confirm" =~ ^[sS]$ ]]; then
+            echo ""
+            handle_auth_sync "impala"
+        fi
+        exit 0
+    else
+        echo -e "${COLOR_RED}[!] No se completó el inicio de sesión.${COLOR_RESET}"
+        if [ -f "${TOKEN_FILE}.bak" ]; then
+            echo -e "-> Restaurando credenciales previas..."
+            mv -f "${TOKEN_FILE}.bak" "$TOKEN_FILE"
+            echo -e "${COLOR_YELLOW}[i] Sesión previa restaurada.${COLOR_RESET}"
+        fi
+        exit 1
+    fi
+}
+
+handle_logout() {
+    echo -e "${COLOR_BLUE}==========================================================${COLOR_RESET}"
+    echo -e "${COLOR_BLUE}             Antigravity CLI - Cerrar Sesión              ${COLOR_RESET}"
+    echo -e "${COLOR_BLUE}==========================================================${COLOR_RESET}"
+
+    if [ ! -f "$TOKEN_FILE" ]; then
+        echo -e "${COLOR_YELLOW}[i] No hay ninguna sesión activa en este equipo.${COLOR_RESET}"
+        exit 0
+    fi
+
+    local info
+    info=$(get_token_info 2>/dev/null)
+    local cur_email
+    cur_email=$(echo "$info" | grep '^EMAIL=' | cut -d= -f2-)
+
+    read -r -p "¿Estás seguro de que deseas cerrar la sesión de '${cur_email}'? [s/N]: " confirm
+    if [[ ! "$confirm" =~ ^[sS]$ ]]; then
+        echo -e "${COLOR_GREEN}[OK] Operación cancelada.${COLOR_RESET}"
+        exit 0
+    fi
+
+    mv -f "$TOKEN_FILE" "${TOKEN_FILE}.bak"
+    echo -e "${COLOR_GREEN}[OK] Sesión cerrada exitosamente (respaldo guardado en .bak).${COLOR_RESET}"
+
+    if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+        echo -e "-> Reiniciando servicio local..."
+        docker restart "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    fi
+    exit 0
+}
+
+handle_auth() {
+    local subcmd="$1"
+    shift 2>/dev/null || true
+    case "$subcmd" in
+        status|"")
+            handle_auth_status
+            ;;
+        sync)
+            handle_auth_sync "$1"
+            ;;
+        *)
+            echo "Subcomando no reconocido: ask auth $subcmd" >&2
+            echo "Uso: ask auth [status|sync [servidor]]" >&2
+            exit 1
+            ;;
+    esac
+}
+
+show_help() {
+    cat <<EOF
+Uso: ask [opciones] "tu consulta..."
+     o bien: echo "texto" | ask [opciones] "instrucción"
+     o bien: ask <subcomando>
+
+Subcomandos:
+  login                  Inicia sesión con tu cuenta de Google mediante enlace OAuth
+  auth [status]          Muestra el estado de la sesión activa de Google/Antigravity
+  auth sync [servidor]   Sincroniza el token con un servidor remoto (ej: impala)
+  set-url <url>          Configura la dirección del servidor en la red (ej: http://20.12.0.2:3000)
+  url                    Muestra la dirección del servidor configurada actualmente
+  logout                 Cierra la sesión actual de Google/Antigravity
+  models                 Lista los modelos y niveles disponibles en la API
+
+Opciones:
+  -c, --continue         Continúa la última conversación (mantiene el contexto)
+  -t, --thinking         Muestra el proceso de pensamiento / razonamiento (Thinking)
+  -m, --model <modelo>   Modelo a usar (ej: claude-sonnet-4-6, gemini-3.8-flash)
+  -l, --level <nivel>    Nivel de esfuerzo/razonamiento (low, medium, high)
+  -s, --stream           Muestra la respuesta en vivo (streaming token por token)
+  -j, --json             Devuelve la respuesta en formato JSON
+  -r, --raw              Muestra texto sin procesar formato ni animación
+  -u, --url <url>        URL base de la API (defecto: http://localhost:3000)
+  --models               Lista los modelos y niveles disponibles en la API
+  -h, --help             Muestra esta ayuda
+
+Ejemplos:
+  ask login
+  ask auth status
+  ask auth sync impala
+  ask dime un chiste de programadores
+  ask -t "what is the best way to structure a web application?"
+  ask -s explica los microservicios en 3 puntos
+  ask -c "ahora explícame el punto 2 con un ejemplo en Node.js"
+  ask -m claude-sonnet-4-6 -l high -t "¿Qué es una transacción ACID?"
+  cat error.log | ask "Explica por qué falló esto"
+  git diff | ask "Genera un mensaje de commit convencional"
+EOF
+    exit 0
+}
+
+list_models() {
+    curl -s "${API_BASE}/models" | jq . 2>/dev/null || curl -s "${API_BASE}/models"
+    echo ""
+    exit 0
+}
+
+# Subcomandos principales
+case "$1" in
+    login)
+        shift
+        handle_login "$@"
+        ;;
+    auth)
+        shift
+        handle_auth "$@"
+        ;;
+    set-url|seturl)
+        shift
+        handle_set_url "$@"
+        ;;
+    url|get-url|geturl)
+        handle_get_url
+        ;;
+    logout)
+        shift
+        handle_logout "$@"
+        ;;
+    models)
+        shift
+        list_models
+        ;;
+esac
+
+# Procesar argumentos y opciones estándar
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            ;;
+        --models)
+            list_models
+            ;;
+        -c|--continue)
+            CONTINUE=true
+            shift
+            ;;
+        -t|--thinking)
+            SHOW_THINKING=true
+            if [ "$JSON_OUTPUT" != true ]; then
+                STREAM=true
+            fi
+            shift
+            ;;
+        -m|--model)
+            MODEL="$2"
+            shift 2
+            ;;
+        -l|--level)
+            LEVEL="$2"
+            shift 2
+            ;;
+        -s|--stream)
+            STREAM=true
+            shift
+            ;;
+        -j|--json)
+            JSON_OUTPUT=true
+            STREAM=false
+            shift
+            ;;
+        -r|--raw)
+            RAW_OUTPUT=true
+            shift
+            ;;
+        -u|--url)
+            API_BASE="$2"
+            shift 2
+            ;;
+        *)
+            QUERY_PARTS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Leer entrada por tubería (pipe / stdin) si existe
+PIPE_INPUT=""
+if [ ! -t 0 ]; then
+    # Evitar bloqueo en entornos no interactivos si no hay datos en el pipe
+    if read -t 0.1 -r first_line; then
+        rest_lines=$(cat)
+        if [ -n "$rest_lines" ]; then
+            PIPE_INPUT="${first_line}
+${rest_lines}"
+        else
+            PIPE_INPUT="${first_line}"
+        fi
+    fi
+fi
+
+QUERY="${QUERY_PARTS[*]}"
+
+if [ -n "$PIPE_INPUT" ]; then
+    if [ -n "$QUERY" ]; then
+        QUERY="${QUERY}
+
+${PIPE_INPUT}"
+    else
+        QUERY="$PIPE_INPUT"
+    fi
+fi
+
+if [ -z "$QUERY" ]; then
+    echo "Error: Debes escribir una consulta. Ejemplo: ask dime un chiste" >&2
+    echo "Usa 'ask --help' para ver las opciones disponibles." >&2
+    exit 1
+fi
+
+# Procesador de salida con animación (spinner) y formateador Markdown a ANSI
+process_output() {
+    # Si no es una terminal interactiva (redirección a archivo o pipe), o se pide json/raw:
+    if [ ! -t 1 ] || [ "$JSON_OUTPUT" = true ] || [ "$RAW_OUTPUT" = true ]; then
+        cat
+        return
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -u -c '
+import sys, re, time, threading
+
+stop_spinner = False
+spinner_cleared = False
+spinner_lock = threading.Lock()
+
+def spin():
+    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    i = 0
+    sys.stderr.write("\033[?25l")
+    while True:
+        with spinner_lock:
+            if stop_spinner:
+                break
+            sys.stderr.write(f"\r\033[36m{frames[i % len(frames)]}\033[0m \033[2mPensando...\033[0m")
+            sys.stderr.flush()
+        i += 1
+        time.sleep(0.08)
+
+t = threading.Thread(target=spin, daemon=True)
+t.start()
+
+def clear_spinner():
+    global stop_spinner, spinner_cleared
+    with spinner_lock:
+        if not spinner_cleared:
+            stop_spinner = True
+            spinner_cleared = True
+            sys.stderr.write("\r\033[2K\033[?25h")
+            sys.stderr.flush()
+
+try:
+    in_thinking = False
+    for line in sys.stdin:
+        clear_spinner()
+
+        # Detectar inicio de bloque de pensamiento
+        if " [Pensamiento]:" in line:
+            in_thinking = True
+            sys.stdout.write("\n\033[1;35m Pensamiento:\033[0m\n")
+            sys.stdout.flush()
+            continue
+        elif in_thinking:
+            # Fin del bloque de pensamiento
+            if line.strip() == "" or line.startswith("⚡ [Acción:") or line.startswith("---"):
+                in_thinking = False
+                sys.stdout.write("\033[35m  └──────────────────────────────────────────────────────────\033[0m\n\n")
+                sys.stdout.flush()
+                if line.strip() == "":
+                    continue
+            else:
+                sys.stdout.write(f"\033[35m  │\033[0m \033[97m{line.rstrip()}\033[0m\n")
+                sys.stdout.flush()
+                continue
+
+        # Formatear acciones de herramientas
+        if line.startswith("⚡ [Acción:"):
+            sys.stdout.write(f"\033[1;33m{line.rstrip()}\033[0m\n")
+            sys.stdout.flush()
+            continue
+
+        # Formatear Markdown a ANSI
+        line = re.sub(r"\*\*([^*]+)\*\*", "\033[1m\\1\033[0m", line)
+        line = re.sub(r"`([^`]+)`", "\033[36m\\1\033[0m", line)
+        line = re.sub(r"^(#{1,6}) (.*)", "\033[1;34m\\2\033[0m", line)
+        line = re.sub(r"^[ \t]*[-*] ", "  \033[32m•\033[0m ", line)
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+    if in_thinking:
+        sys.stdout.write("\033[35m  └──────────────────────────────────────────────────────────\033[0m\n\n")
+        sys.stdout.flush()
+finally:
+    clear_spinner()
+'
+    else
+        sed -u -E \
+            -e 's/\*\*([^*]+)\*\*/'$'\033''[1m\1'$'\033''[0m/g' \
+            -e 's/`([^`]+)`/'$'\033''[36m\1'$'\033''[0m/g' \
+            -e 's/^(#{1,6}) (.*)/'$'\033''[1;34m\2'$'\033''[0m/g' \
+            -e 's/^[ \t]*[-*] /  '$'\033''[32m•'$'\033''[0m /g'
+    fi
+}
+
+# Construir JSON con jq o python3
+PAYLOAD=""
+if command -v jq >/dev/null 2>&1; then
+    PAYLOAD=$(jq -n \
+        --arg q "$QUERY" \
+        --arg m "$MODEL" \
+        --arg l "$LEVEL" \
+        --argjson s "$STREAM" \
+        --argjson c "$CONTINUE" \
+        --argjson t "$SHOW_THINKING" \
+        --argjson j "$JSON_OUTPUT" \
+        '{query: $q} + (if $m != "" then {model: $m} else {} end) + (if $l != "" then {level: $l} else {} end) + (if $s then {stream: true} else {} end) + (if $c then {continue: true} else {} end) + (if $t then {thinking: true} else {} end) + (if $j then {json: true} else {} end)')
+else
+    PAYLOAD=$(python3 -c 'import json, sys; print(json.dumps({"query": sys.argv[1], "model": sys.argv[2] or None, "level": sys.argv[3] or None, "stream": sys.argv[4] == "true", "continue": sys.argv[5] == "true", "thinking": sys.argv[6] == "true", "json": sys.argv[7] == "true"}))' "$QUERY" "$MODEL" "$LEVEL" "$STREAM" "$CONTINUE" "$SHOW_THINKING" "$JSON_OUTPUT")
+fi
+
+ENDPOINT="${API_BASE}/ask"
+
+if [ "$STREAM" = true ]; then
+    curl -N -s -X POST "$ENDPOINT" \
+        -H "Content-Type: application/json" \
+        -d "$PAYLOAD" | process_output
+else
+    curl -s -X POST "$ENDPOINT" \
+        -H "Content-Type: application/json" \
+        -d "$PAYLOAD" | process_output
+fi
+echo ""

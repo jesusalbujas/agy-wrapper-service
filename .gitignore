@@ -1,0 +1,20 @@
+# Local credentials and developer-specific configuration
+.env
+.env.*
+!.env.example
+docker/.env
+**/antigravity-oauth-token
+**/auth.json
+
+# Local data, uploads, caches, and nested projects
+node_modules/
+uploads/*
+!uploads/.gitkeep
+resources/*
+!resources/.gitkeep
+scratch/
+*.log
+*.sqlite
+*.db
+*.pem
+*.key
