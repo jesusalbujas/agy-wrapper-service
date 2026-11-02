@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"time"
 )
 
 func (app *application) resolveOptions(body map[string]any, query map[string][]string) requestOptions {
@@ -58,54 +57,11 @@ func normalizeLevel(level string) string {
 }
 
 func (app *application) executeAgy(ctx context.Context, query string, opts requestOptions) (commandResult, error) {
-	result, nativeErr := app.runNativeAgy(ctx, query, opts, "json")
+	result, nativeErr := app.runAgyTurn(ctx, query, opts, nil)
 	if nativeErr == nil {
 		return result, nil
 	}
-	log.Printf("native agy failed (%v); trying the companion-for-agy fallback", nativeErr)
-	return app.runCompanionFallback(ctx, query, opts)
-}
-
-func (app *application) runNativeAgy(ctx context.Context, query string, opts requestOptions, outputFormat string) (commandResult, error) {
-	args := []string{"--dangerously-skip-permissions", "--add-dir", opts.WorkspaceDir, "--output-format", outputFormat}
-	if opts.ConversationID != "" {
-		args = append(args, "--conversation", opts.ConversationID)
-	} else if opts.Continue {
-		args = append(args, "-c")
-	}
-	if opts.Model != "" {
-		args = append(args, "--model", opts.Model)
-	}
-	if opts.Effort != "" {
-		args = append(args, "--effort", opts.Effort)
-	}
-	args = append(args, "-p", query)
-
-	cmd := exec.CommandContext(ctx, app.agyPath, args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	output, err := cmd.Output()
-	if err != nil {
-		message := strings.TrimSpace(stderr.String())
-		if message == "" {
-			message = err.Error()
-		}
-		return commandResult{}, fmt.Errorf("%s", message)
-	}
-
-	var meta map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(output), &meta); err != nil {
-		return commandResult{Response: strings.TrimSpace(string(output)), Tools: []any{}}, nil
-	}
-	conversationID := stringValue(meta["conversation_id"])
-	thinking := app.getThinkingFromTranscript(conversationID)
-	tools := app.getToolActionsFromTranscript(conversationID)
-	return commandResult{
-		Response: strings.TrimSpace(stringValue(meta["response"])),
-		Thinking: thinking,
-		Tools:    tools,
-		Meta:     meta,
-	}, nil
+	return app.fallbackIfAgyMissing(ctx, query, opts, nativeErr)
 }
 
 func (app *application) runCompanionFallback(ctx context.Context, query string, opts requestOptions) (commandResult, error) {
@@ -144,6 +100,9 @@ func (app *application) formatResponse(w http.ResponseWriter, r *http.Request, b
 		result.Tools = []any{}
 	}
 	showThinking := boolValue(body["thinking"]) || r.URL.Query().Get("thinking") == "true" || os.Getenv("SHOW_THINKING") == "true"
+	if showThinking && result.Thinking == nil && conversationID != "" {
+		result.Thinking = app.getThinkingFromTranscript(conversationID)
+	}
 	wantsJSON := boolValue(body["json"]) || r.URL.Query().Get("json") == "true" || strings.Contains(r.Header.Get("Accept"), "application/json")
 	if wantsJSON {
 		writeJSON(w, http.StatusOK, map[string]any{"response": result.Response, "thinking": result.Thinking, "tools": result.Tools, "conversation_id": nullableString(conversationID)})
@@ -165,7 +124,7 @@ func (app *application) formatResponse(w http.ResponseWriter, r *http.Request, b
 	_, _ = io.WriteString(w, response)
 }
 
-func (app *application) streamAgy(w http.ResponseWriter, r *http.Request, query string, opts requestOptions, forceSSE bool) {
+func (app *application) streamAgy(w http.ResponseWriter, r *http.Request, query string, opts requestOptions, forceSSE bool, showThinking bool) {
 	isSSE := wantsSSE(r) || forceSSE
 	if isSSE {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -175,90 +134,14 @@ func (app *application) streamAgy(w http.ResponseWriter, r *http.Request, query 
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	}
 
-	args := []string{"--dangerously-skip-permissions", "--add-dir", opts.WorkspaceDir, "--output-format", "stream-json"}
-	if opts.ConversationID != "" {
-		args = append(args, "--conversation", opts.ConversationID)
-	} else if opts.Continue {
-		args = append(args, "-c")
-	}
-	if opts.Model != "" {
-		args = append(args, "--model", opts.Model)
-	}
-	if opts.Effort != "" {
-		args = append(args, "--effort", opts.Effort)
-	}
-	args = append(args, "-p", query)
-
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-	cmd := exec.CommandContext(ctx, app.agyPath, args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "Failed to start agy", "details": err.Error()})
-		return
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "Failed to start agy", "details": err.Error()})
-		return
-	}
-	if err := cmd.Start(); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "Failed to start agy", "details": err.Error()})
-		return
-	}
-
-	lineChannel := make(chan string, 64)
-	stdoutDone := make(chan struct{})
-	go func() {
-		defer close(stdoutDone)
-		defer close(lineChannel)
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 64*1024), maxCommandOutput)
-		for scanner.Scan() {
-			select {
-			case lineChannel <- scanner.Text():
-			case <-ctx.Done():
-				return
-			}
-		}
-		if err := scanner.Err(); err != nil && ctx.Err() == nil {
-			log.Printf("agy output stream: %v", err)
-		}
-	}()
-	go logCommandStderr(stderr)
-	waitChannel := make(chan error, 1)
-
-	var convID = opts.ConversationID
-	var emittedThinking = make(map[int]struct{})
-	var ticker *time.Ticker
-	var tickerChannel <-chan time.Time
-	wroteResponse := false
-	lines := lineChannel
-	var commandErr error
-	waited := false
-	waitStarted := false
-	defer func() {
-		cancel()
-		if waitStarted {
-			if !waited {
-				<-waitChannel
-			}
-			return
-		}
-		if stdoutDone != nil {
-			<-stdoutDone
-		}
-		_ = cmd.Wait()
-	}()
-
 	flush := func() {
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
 	}
+	wroteResponse := false
 	writeChunk := func(chunk string) bool {
 		if _, err := io.WriteString(w, chunk); err != nil {
-			cancel()
 			return false
 		}
 		wroteResponse = true
@@ -272,141 +155,101 @@ func (app *application) streamAgy(w http.ResponseWriter, r *http.Request, query 
 		}
 		return writeChunk("data: " + string(encoded) + "\n\n")
 	}
-	checkTranscript := func() bool {
-		if convID == "" {
-			return true
-		}
-		path := app.transcriptPath(convID)
-		file, err := os.Open(path)
-		if err != nil {
-			return true
-		}
-		defer file.Close()
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 64*1024), maxCommandOutput)
-		index := 0
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line != "" {
-				if _, exists := emittedThinking[index]; !exists {
-					var step map[string]any
-					if json.Unmarshal([]byte(line), &step) == nil {
-						if thought := strings.TrimSpace(stringValue(step["thinking"])); thought != "" {
-							emittedThinking[index] = struct{}{}
-							if isSSE {
-								if !writeSSE(map[string]any{"type": "thinking", "text": thought}) {
-									return false
-								}
-							} else if !writeChunk("\n💭 [Thoughts]:\n" + thought + "\n\n") {
-								return false
-							}
-						}
+	conversationID := opts.ConversationID
+	if conversationID != "" {
+		w.Header().Set("X-Conversation-Id", conversationID)
+	}
+	onEvent := func(event map[string]any) error {
+		switch stringValue(event["event"]) {
+		case "init":
+			if id := stringValue(event["conversation_id"]); id != "" {
+				conversationID = id
+				w.Header().Set("X-Conversation-Id", id)
+			}
+		case "step_update":
+			step, _ := event["step_update"].(map[string]any)
+			if step == nil {
+				return nil
+			}
+			stepType := stringValue(step["step_type"])
+			if stepType == "tool" && stringValue(step["state"]) == "ACTIVE" {
+				toolName := firstNonEmpty(stringValue(step["tool_name"]), nestedString(step, "tool_info", "name"), "tool")
+				toolInfo, _ := step["tool_info"].(map[string]any)
+				var params any
+				if toolInfo != nil {
+					params = toolInfo["parameters"]
+				}
+				if isSSE {
+					if !writeSSE(map[string]any{"type": "tool", "tool": toolName, "params": params}) {
+						return io.ErrClosedPipe
+					}
+				} else {
+					paramStr := ""
+					if values, ok := params.(map[string]any); ok && stringValue(values["CommandLine"]) != "" {
+						paramStr = " -> " + stringValue(values["CommandLine"])
+					}
+					if !writeChunk(fmt.Sprintf("\n⚡ [Action: %s%s]\n", toolName, paramStr)) {
+						return io.ErrClosedPipe
 					}
 				}
-				index++
+			} else if stepType == "agent_response" && stringValue(step["text_delta"]) != "" {
+				delta := stringValue(step["text_delta"])
+				if isSSE {
+					if !writeSSE(map[string]any{"type": "text", "text": delta}) {
+						return io.ErrClosedPipe
+					}
+				} else if !writeChunk(delta) {
+					return io.ErrClosedPipe
+				}
 			}
 		}
-		return true
+		return nil
 	}
 
-	for lines != nil || !waited {
-		select {
-		case <-r.Context().Done():
-			cancel()
-			return
-		case line, ok := <-lines:
-			if !ok {
-				lines = nil
-				continue
+	result, err := app.runAgyTurn(r.Context(), query, opts, onEvent)
+	if errors.Is(err, exec.ErrNotFound) {
+		result, err = app.runCompanionFallback(r.Context(), query, opts)
+	}
+	if err != nil {
+		if wroteResponse {
+			if isSSE {
+				_ = writeSSE(map[string]any{"type": "error", "error": err.Error()})
+			} else {
+				_ = writeChunk("\n[Antigravity error: " + err.Error() + "]\n")
 			}
-			var event map[string]any
-			if json.Unmarshal([]byte(strings.TrimSpace(line)), &event) != nil {
-				continue
-			}
-			switch stringValue(event["event"]) {
-			case "init":
-				if id := stringValue(event["conversation_id"]); id != "" {
-					convID = id
-					w.Header().Set("X-Conversation-Id", convID)
-					if ticker == nil {
-						ticker = time.NewTicker(80 * time.Millisecond)
-						tickerChannel = ticker.C
-					}
-				}
-			case "step_update":
-				step, _ := event["step_update"].(map[string]any)
-				if step == nil {
-					continue
-				}
-				stepType := stringValue(step["step_type"])
-				if stepType == "tool" && stringValue(step["state"]) == "ACTIVE" {
-					toolName := firstNonEmpty(stringValue(step["tool_name"]), nestedString(step, "tool_info", "name"), "tool")
-					toolInfo, _ := step["tool_info"].(map[string]any)
-					var params any
-					if toolInfo != nil {
-						params = toolInfo["parameters"]
-					}
-					if isSSE {
-						if !writeSSE(map[string]any{"type": "tool", "tool": toolName, "params": params}) {
-							return
-						}
-					} else {
-						paramStr := ""
-						if values, ok := params.(map[string]any); ok && stringValue(values["CommandLine"]) != "" {
-							paramStr = " -> " + stringValue(values["CommandLine"])
-						}
-						if !writeChunk(fmt.Sprintf("\n⚡ [Action: %s%s]\n", toolName, paramStr)) {
-							return
-						}
-					}
-				} else if stepType == "agent_response" && stringValue(step["text_delta"]) != "" {
-					delta := stringValue(step["text_delta"])
-					if isSSE {
-						if !writeSSE(map[string]any{"type": "text", "text": delta}) {
-							return
-						}
-					} else if !writeChunk(delta) {
-						return
-					}
-				}
-			case "result":
-				if !checkTranscript() {
-					return
-				}
-				if isSSE && !writeChunk("data: [DONE]\n\n") {
-					return
-				}
-			}
-		case <-tickerChannel:
-			if !checkTranscript() {
+		} else {
+			writeJSON(w, agyErrorStatus(err), map[string]any{"error": "Failed to run Antigravity CLI", "details": err.Error()})
+		}
+		return
+	}
+	if result.Meta != nil {
+		if id := stringValue(result.Meta["conversation_id"]); id != "" {
+			conversationID = id
+			w.Header().Set("X-Conversation-Id", id)
+		}
+	}
+	if !wroteResponse && result.Response != "" {
+		if isSSE {
+			if !writeSSE(map[string]any{"type": "text", "text": result.Response}) {
 				return
 			}
-		case err := <-waitChannel:
-			commandErr = err
-			waited = true
-			waitChannel = nil
-		case <-stdoutDone:
-			stdoutDone = nil
-			if !waited {
-				waitStarted = true
-				go func() { waitChannel <- cmd.Wait() }()
+		} else if !writeChunk(result.Response) {
+			return
+		}
+	}
+	if showThinking && conversationID != "" {
+		if thinking := app.getThinkingFromTranscript(conversationID); thinking != nil {
+			if isSSE {
+				if !writeSSE(map[string]any{"type": "thinking", "text": *thinking}) {
+					return
+				}
+			} else if !writeChunk("\n💭 [Thoughts]:\n" + *thinking + "\n") {
+				return
 			}
 		}
 	}
-	if ticker != nil {
-		ticker.Stop()
-	}
-	if !checkTranscript() {
-		return
-	}
-	if commandErr != nil && !wroteResponse {
-		var exitErr *exec.ExitError
-		if errors.As(commandErr, &exitErr) {
-			http.Error(w, fmt.Sprintf("agy failed (exit code %d)", exitErr.ExitCode()), http.StatusInternalServerError)
-		} else {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "Failed to start agy", "details": commandErr.Error()})
-		}
-		return
+	if isSSE {
+		_ = writeChunk("data: [DONE]\n\n")
 	}
 }
 

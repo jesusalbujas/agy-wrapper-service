@@ -24,12 +24,22 @@ To run the API directly on a machine with Go and `agy` installed, run `go run .`
 
 ## API
 
-- `POST /ask` — run a prompt; accepts `query`, optional `model`, `level`, `stream`, `continue`, `conversation_id`, and output options.
+- `POST /ask` — run a prompt; accepts `query`, optional `model`, `level`, `stream`, `continue`, `conversation_id`, and output options. The response returns the conversation ID in `X-Conversation-Id` and JSON responses.
 - `GET|POST /ask/stream` — stream a prompt response.
 - `POST /ask-file` — analyze an uploaded file or a file path available inside the container.
 - `GET /models` — list available models.
 - `GET /health` — service health and defaults.
 - `GET /` — service status and endpoint index.
+
+## Conversation sessions and streaming
+
+The API keeps a separate Antigravity CLI process warm for each conversation ID. Reuse the returned `X-Conversation-Id` as `conversation_id` on the next request to avoid starting a new CLI process and to preserve that conversation's context. The included `ask` client saves the most recent ID for its configured API URL; use `ask -c` to continue it.
+
+Conversation IDs identify the context and must be treated as private. The wrapper does not authenticate API users, so anyone who obtains an ID can continue that conversation; restrict API access and do not share IDs between users.
+
+Each conversation processes one request at a time. A concurrent request for the same conversation receives HTTP `409`; retry it after the current turn finishes. The API keeps up to `AGY_MAX_SESSIONS` warm sessions (default `32`) and closes sessions after `AGY_SESSION_IDLE_TIMEOUT` without use (default `15m`). If the server restarts or evicts a session, the next request resumes the saved conversation ID in a new CLI process.
+
+Set `stream: true` or request `text/event-stream` to receive response chunks as Antigravity produces them. Streaming improves time to first visible text; it does not change the model's inference speed. The wrapper only falls back to `companion-for-agy` when the `agy` executable cannot be started; model, authentication, timeout, and request errors are returned directly.
 
 Example:
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -50,6 +51,28 @@ func writePlainError(w http.ResponseWriter, status int, message string) {
 
 func wantsSSE(r *http.Request) bool {
 	return strings.Contains(r.Header.Get("Accept"), "text/event-stream") || r.URL.Query().Get("sse") == "true"
+}
+
+func wantsThinking(r *http.Request, body map[string]any) bool {
+	return boolValue(body["thinking"]) || r.URL.Query().Get("thinking") == "true" || os.Getenv("SHOW_THINKING") == "true"
+}
+
+func agyErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, errAgySessionBusy):
+		return http.StatusConflict
+	case errors.Is(err, errAgySessionLimit):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func validateAgyOptions(opts requestOptions) error {
+	if opts.Continue && opts.ConversationID == "" {
+		return errors.New("continuing a conversation requires its conversation_id")
+	}
+	return nil
 }
 
 func stringValue(value any) string {

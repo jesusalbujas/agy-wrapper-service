@@ -32,17 +32,21 @@ func (app *application) handleAsk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	opts := app.resolveOptions(body, r.URL.Query())
+	if err := validateAgyOptions(opts); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
 	wantsStream := boolValue(body["stream"]) || r.URL.Query().Get("stream") == "true" || strings.Contains(r.Header.Get("Accept"), "text/event-stream")
 	log.Printf("/ask: %q | Model: %s | Effort: %s | Stream: %t | Continue: %t", truncate(query, 80), opts.Model, valueOr(opts.Effort, "default"), wantsStream, opts.Continue)
 	if wantsStream {
-		app.streamAgy(w, r, query, opts, boolValue(body["sse"]))
+		app.streamAgy(w, r, query, opts, boolValue(body["sse"]), wantsThinking(r, body))
 		return
 	}
 
 	result, err := app.executeAgy(r.Context(), query, opts)
 	if err != nil {
 		log.Printf("error in /ask: %v", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
+		writeJSON(w, agyErrorStatus(err), map[string]any{
 			"error":   "An error occurred while running the Antigravity CLI.",
 			"details": err.Error(),
 		})
@@ -78,10 +82,14 @@ func (app *application) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opts := app.resolveOptions(body, r.URL.Query())
+	if err := validateAgyOptions(opts); err != nil {
+		writePlainError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if r.Method == http.MethodGet {
 		opts.WorkspaceDir = defaultWorkspace
 	}
-	app.streamAgy(w, r, query, opts, boolValue(body["sse"]))
+	app.streamAgy(w, r, query, opts, boolValue(body["sse"]), wantsThinking(r, body))
 }
 
 func (app *application) handleAskFile(w http.ResponseWriter, r *http.Request) {
@@ -111,17 +119,21 @@ func (app *application) handleAskFile(w http.ResponseWriter, r *http.Request) {
 	}
 	opts := app.resolveOptions(body, r.URL.Query())
 	opts.WorkspaceDir = defaultWorkspace
+	if err := validateAgyOptions(opts); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
 	fullPrompt := fmt.Sprintf("Instruction: %s\nFile to inspect: %q (original name: %q).\nRead the file and respond to the instruction.", instruction, filePath, originalName)
 
 	log.Printf("/ask-file: File %q | Instruction: %q", originalName, truncate(instruction, 60))
 	if boolValue(body["stream"]) || r.URL.Query().Get("stream") == "true" || strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
-		app.streamAgy(w, r, fullPrompt, opts, boolValue(body["sse"]))
+		app.streamAgy(w, r, fullPrompt, opts, boolValue(body["sse"]), wantsThinking(r, body))
 		return
 	}
 	result, err := app.executeAgy(r.Context(), fullPrompt, opts)
 	if err != nil {
 		log.Printf("error in /ask-file: %v", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "Failed to analyze the file", "details": err.Error()})
+		writeJSON(w, agyErrorStatus(err), map[string]any{"error": "Failed to analyze the file", "details": err.Error()})
 		return
 	}
 	app.formatResponse(w, r, body, result, opts)
@@ -140,7 +152,7 @@ func parseFileRequest(w http.ResponseWriter, r *http.Request, uploadDir string) 
 		if r.MultipartForm != nil {
 			cleanup = func() { _ = r.MultipartForm.RemoveAll() }
 		}
-		for _, key := range []string{"query", "instruction", "filePath", "model", "level", "effort", "stream", "json", "full", "thinking", "workspaceDir"} {
+		for _, key := range []string{"query", "instruction", "filePath", "model", "level", "effort", "stream", "json", "full", "thinking", "workspaceDir", "conversation_id", "conversation", "continue", "c"} {
 			if value := r.FormValue(key); value != "" {
 				body[key] = value
 			}

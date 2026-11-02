@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -19,12 +21,15 @@ const (
 var safeFilename = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
 
 type application struct {
-	port         string
-	defaultModel string
-	defaultLevel string
-	agyPath      string
-	uploadDir    string
-	geminiDir    string
+	port               string
+	defaultModel       string
+	defaultLevel       string
+	agyPath            string
+	uploadDir          string
+	geminiDir          string
+	maxSessions        int
+	sessionIdleTimeout time.Duration
+	sessions           *agySessionManager
 }
 
 type requestOptions struct {
@@ -62,13 +67,27 @@ func newApplication() *application {
 	if _, err := os.Stat(agyPath); err != nil {
 		agyPath = "agy"
 	}
+	maxSessions := 32
+	if configured := strings.TrimSpace(os.Getenv("AGY_MAX_SESSIONS")); configured != "" {
+		if parsed, err := strconv.Atoi(configured); err == nil && parsed > 0 {
+			maxSessions = parsed
+		}
+	}
+	sessionIdleTimeout := 15 * time.Minute
+	if configured := strings.TrimSpace(os.Getenv("AGY_SESSION_IDLE_TIMEOUT")); configured != "" {
+		if parsed, err := time.ParseDuration(configured); err == nil && parsed > 0 {
+			sessionIdleTimeout = parsed
+		}
+	}
 	return &application{
-		port:         port,
-		defaultModel: model,
-		defaultLevel: level,
-		agyPath:      agyPath,
-		uploadDir:    uploadDir,
-		geminiDir:    geminiDir,
+		port:               port,
+		defaultModel:       model,
+		defaultLevel:       level,
+		agyPath:            agyPath,
+		uploadDir:          uploadDir,
+		geminiDir:          geminiDir,
+		maxSessions:        maxSessions,
+		sessionIdleTimeout: sessionIdleTimeout,
 	}
 }
 

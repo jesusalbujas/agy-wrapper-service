@@ -24,7 +24,15 @@ QUERY_PARTS=()
 
 TOKEN_DIR="${HOME}/.gemini/antigravity-cli"
 TOKEN_FILE="${TOKEN_DIR}/antigravity-oauth-token"
+LAST_CONVERSATION_FILE="${TOKEN_DIR}/agy-wrapper-last-conversation"
 CONTAINER_NAME="agy-api-wrapper"
+SAVED_CONVERSATION_ID=""
+if [ -f "$LAST_CONVERSATION_FILE" ]; then
+    SAVED_CONVERSATION_URL=$(sed -n '1p' "$LAST_CONVERSATION_FILE" 2>/dev/null)
+    if [ "$SAVED_CONVERSATION_URL" = "$API_BASE" ]; then
+        SAVED_CONVERSATION_ID=$(sed -n '2p' "$LAST_CONVERSATION_FILE" 2>/dev/null | tr -d '\r\n')
+    fi
+fi
 
 handle_set_url() {
     local new_url="$1"
@@ -316,6 +324,7 @@ handle_logout() {
     fi
 
     mv -f "$TOKEN_FILE" "${TOKEN_FILE}.bak"
+    rm -f "$LAST_CONVERSATION_FILE"
     echo -e "${COLOR_GREEN}[OK] Signed out successfully (backup saved as .bak).${COLOR_RESET}"
 
     if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
@@ -503,6 +512,11 @@ if [ -z "$QUERY" ]; then
     exit 1
 fi
 
+if [ "$CONTINUE" = true ] && [ -z "$SAVED_CONVERSATION_ID" ]; then
+    echo "Error: No saved conversation exists for this API URL. Start a conversation first, then use -c." >&2
+    exit 1
+fi
+
 # Spinner and Markdown-to-ANSI output formatter
 process_output() {
     # Skip formatting for non-interactive output and JSON/raw modes
@@ -604,24 +618,33 @@ if command -v jq >/dev/null 2>&1; then
         --arg q "$QUERY" \
         --arg m "$MODEL" \
         --arg l "$LEVEL" \
+        --arg cid "$SAVED_CONVERSATION_ID" \
         --argjson s "$STREAM" \
         --argjson c "$CONTINUE" \
         --argjson t "$SHOW_THINKING" \
         --argjson j "$JSON_OUTPUT" \
-        '{query: $q} + (if $m != "" then {model: $m} else {} end) + (if $l != "" then {level: $l} else {} end) + (if $s then {stream: true} else {} end) + (if $c then {continue: true} else {} end) + (if $t then {thinking: true} else {} end) + (if $j then {json: true} else {} end)')
+        '{query: $q} + (if $m != "" then {model: $m} else {} end) + (if $l != "" then {level: $l} else {} end) + (if $s then {stream: true} else {} end) + (if $c and $cid != "" then {conversation_id: $cid} elif $c then {continue: true} else {} end) + (if $t then {thinking: true} else {} end) + (if $j then {json: true} else {} end)')
 else
-    PAYLOAD=$(python3 -c 'import json, sys; print(json.dumps({"query": sys.argv[1], "model": sys.argv[2] or None, "level": sys.argv[3] or None, "stream": sys.argv[4] == "true", "continue": sys.argv[5] == "true", "thinking": sys.argv[6] == "true", "json": sys.argv[7] == "true"}))' "$QUERY" "$MODEL" "$LEVEL" "$STREAM" "$CONTINUE" "$SHOW_THINKING" "$JSON_OUTPUT")
+    PAYLOAD=$(python3 -c 'import json, sys; p={"query":sys.argv[1],"model":sys.argv[2] or None,"level":sys.argv[3] or None,"stream":sys.argv[4]=="true","thinking":sys.argv[6]=="true","json":sys.argv[7]=="true"}; p.update(({"conversation_id":sys.argv[8]} if sys.argv[5]=="true" and sys.argv[8] else ({"continue":True} if sys.argv[5]=="true" else {}))); print(json.dumps(p))' "$QUERY" "$MODEL" "$LEVEL" "$STREAM" "$CONTINUE" "$SHOW_THINKING" "$JSON_OUTPUT" "$SAVED_CONVERSATION_ID")
 fi
 
 ENDPOINT="${API_BASE}/ask"
+RESPONSE_HEADERS=$(mktemp)
 
 if [ "$STREAM" = true ]; then
-    curl -N -s -X POST "$ENDPOINT" \
+    curl -N -sS -D "$RESPONSE_HEADERS" -X POST "$ENDPOINT" \
         -H "Content-Type: application/json" \
         -d "$PAYLOAD" | process_output
 else
-    curl -s -X POST "$ENDPOINT" \
+    curl -sS -D "$RESPONSE_HEADERS" -X POST "$ENDPOINT" \
         -H "Content-Type: application/json" \
         -d "$PAYLOAD" | process_output
 fi
+
+NEW_CONVERSATION_ID=$(awk 'tolower($1) == "x-conversation-id:" { gsub("\\r", "", $2); value=$2 } END { print value }' "$RESPONSE_HEADERS" 2>/dev/null)
+if [ -n "$NEW_CONVERSATION_ID" ]; then
+    mkdir -p "$TOKEN_DIR"
+    printf '%s\n%s\n' "$API_BASE" "$NEW_CONVERSATION_ID" > "$LAST_CONVERSATION_FILE"
+fi
+rm -f "$RESPONSE_HEADERS"
 echo ""

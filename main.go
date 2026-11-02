@@ -16,6 +16,7 @@ func main() {
 	configurePath()
 
 	app := newApplication()
+	app.sessions = newAgySessionManager(app, app.maxSessions, app.sessionIdleTimeout)
 	if err := os.MkdirAll(app.uploadDir, 0o750); err != nil {
 		log.Fatalf("create uploads directory: %v", err)
 	}
@@ -37,16 +38,19 @@ func main() {
 	}
 
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	shutdownComplete := make(chan struct{})
 
 	go func() {
 		<-shutdownCtx.Done()
+		defer close(shutdownComplete)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
 			log.Printf("graceful shutdown failed: %v", err)
+			_ = server.Close()
 		}
 	}()
+	go app.sessions.cleanupLoop(shutdownCtx)
 
 	log.Printf("Antigravity CLI wrapper listening on port %s", app.port)
 	log.Printf("Default model: %s", app.defaultModel)
@@ -55,6 +59,9 @@ func main() {
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("HTTP server failed: %v", err)
 	}
+	stop()
+	<-shutdownComplete
+	app.sessions.closeAll()
 }
 
 func logRequests(next http.Handler) http.Handler {

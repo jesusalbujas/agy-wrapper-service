@@ -39,30 +39,3 @@ func (app *application) getThinkingFromTranscript(conversationID string) *string
 	joined := strings.Join(thoughts, "\n\n---\n\n")
 	return &joined
 }
-
-func (app *application) getToolActionsFromTranscript(conversationID string) []any {
-	tools := make([]any, 0)
-	if conversationID == "" {
-		return tools
-	}
-	file, err := os.Open(app.transcriptPath(conversationID))
-	if err != nil {
-		return tools
-	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), maxCommandOutput)
-	for scanner.Scan() {
-		var step map[string]any
-		if json.Unmarshal(scanner.Bytes(), &step) != nil {
-			continue
-		}
-		calls, _ := step["tool_calls"].([]any)
-		for _, call := range calls {
-			if toolCall, ok := call.(map[string]any); ok {
-				tools = append(tools, map[string]any{"name": toolCall["name"], "args": toolCall["args"]})
-			}
-		}
-	}
-	return tools
-}
