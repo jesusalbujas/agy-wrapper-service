@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"mime/multipart"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -176,4 +178,159 @@ func TestSessionManagerConcurrencyAndEviction(t *testing.T) {
 		t.Fatalf("acquire id2 after release failed: %v", err)
 	}
 	manager.release(s2)
+}
+
+func TestAuthAndCORSMiddleware(t *testing.T) {
+	app := &application{
+		apiKey:      "super-secret-key",
+		corsOrigins: []string{"http://localhost:5173"},
+		startedAt:   time.Now(),
+		maxSessions: 32,
+	}
+	handler := withCORS(app, withAuth(app, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})))
+
+	// 1. Preflight OPTIONS succeeds without auth and sets CORS headers.
+	optReq := httptest.NewRequest(http.MethodOptions, "/ask", nil)
+	optReq.Header.Set("Origin", "http://localhost:5173")
+	optRec := httptest.NewRecorder()
+	handler.ServeHTTP(optRec, optReq)
+	if optRec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for OPTIONS, got %d", optRec.Code)
+	}
+	if got := optRec.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:5173" {
+		t.Fatalf("unexpected Allow-Origin: %q", got)
+	}
+	if got := optRec.Header().Get("Access-Control-Expose-Headers"); !strings.Contains(got, "X-Conversation-Id") {
+		t.Fatalf("expected X-Conversation-Id in Expose-Headers, got %q", got)
+	}
+
+	// 2. /health stays public.
+	healthReq := httptest.NewRequest(http.MethodGet, "/health", nil)
+	healthRec := httptest.NewRecorder()
+	handler.ServeHTTP(healthRec, healthReq)
+	if healthRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /health, got %d", healthRec.Code)
+	}
+
+	// 3. Protected endpoint rejects missing/invalid API key.
+	unauthReq := httptest.NewRequest(http.MethodGet, "/models", nil)
+	unauthRec := httptest.NewRecorder()
+	handler.ServeHTTP(unauthRec, unauthReq)
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without key, got %d", unauthRec.Code)
+	}
+
+	// 4. Bearer and X-API-Key succeed.
+	bearerReq := httptest.NewRequest(http.MethodGet, "/models", nil)
+	bearerReq.Header.Set("Authorization", "Bearer super-secret-key")
+	bearerRec := httptest.NewRecorder()
+	handler.ServeHTTP(bearerRec, bearerReq)
+	if bearerRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with Bearer key, got %d", bearerRec.Code)
+	}
+
+	headerReq := httptest.NewRequest(http.MethodGet, "/models", nil)
+	headerReq.Header.Set("X-API-Key", "super-secret-key")
+	headerRec := httptest.NewRecorder()
+	handler.ServeHTTP(headerRec, headerReq)
+	if headerRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with X-API-Key, got %d", headerRec.Code)
+	}
+}
+
+func TestHandleConversationDetail(t *testing.T) {
+	geminiDir := t.TempDir()
+	convID := "123e4567-e89b-12d3-a456-426614174099"
+	annDir := filepath.Join(geminiDir, "antigravity-cli", "annotations")
+	logsDir := filepath.Join(geminiDir, "antigravity-cli", "brain", convID, ".system_generated", "logs")
+	for _, dir := range []string{annDir, logsDir} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(annDir, convID+".pbtxt"), []byte("title: \"NexoInt Integration\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	transcript := strings.Join([]string{
+		`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-17T10:00:00Z","content":"Hola"}`,
+		`{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-17T10:00:01Z","thinking":"step","tool_calls":[{"name":"read_file"}]}`,
+		`{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-17T10:00:02Z","content":"Hola, ¿en qué ayudo?"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(logsDir, "transcript.jsonl"), []byte(transcript), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &application{geminiDir: geminiDir}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/conversations/"+convID+"?limit=1", nil)
+	app.handleConversationRoutes(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		ConversationID string                `json:"conversation_id"`
+		Name           string                `json:"name"`
+		Count          int                   `json:"count"`
+		Messages       []conversationMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Name != "NexoInt Integration" || payload.Count != 1 || payload.Messages[0].Role != "assistant" || payload.Messages[0].Content != "Hola, ¿en qué ayudo?" {
+		t.Fatalf("unexpected conversation detail payload: %+v", payload)
+	}
+}
+
+func TestHandleSessionAndHealthMetrics(t *testing.T) {
+	app := &application{
+		defaultModel:       defaultModel,
+		defaultLevel:       "medium",
+		workspaceDir:       "/app",
+		uploadDir:          "/app/uploads",
+		apiKey:             "k",
+		startedAt:          time.Now().Add(-5 * time.Second),
+		maxSessions:        8,
+		sessionIdleTimeout: 15 * time.Minute,
+	}
+	app.sessions = newAgySessionManager(app, app.maxSessions, app.sessionIdleTimeout)
+
+	convID := "123e4567-e89b-12d3-a456-426614174010"
+	session, err := app.sessions.acquire(convID, requestOptions{Model: defaultModel})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Health reflects activeSessions=1.
+	hRec := httptest.NewRecorder()
+	app.handleHealth(hRec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	var health map[string]any
+	_ = json.Unmarshal(hRec.Body.Bytes(), &health)
+	if health["activeSessions"] != float64(1) || health["maxSessions"] != float64(8) || health["authEnabled"] != true {
+		t.Fatalf("unexpected health payload: %+v", health)
+	}
+
+	// Busy session returns 409 on DELETE.
+	busyRec := httptest.NewRecorder()
+	app.handleSession(busyRec, httptest.NewRequest(http.MethodDelete, "/sessions/"+convID, nil))
+	if busyRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 when closing busy session, got %d", busyRec.Code)
+	}
+
+	// Release and DELETE -> 200 closed=true.
+	app.sessions.release(session)
+	delRec := httptest.NewRecorder()
+	app.handleSession(delRec, httptest.NewRequest(http.MethodDelete, "/sessions/"+convID, nil))
+	if delRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 when closing idle session, got %d: %s", delRec.Code, delRec.Body.String())
+	}
+
+	// Second DELETE -> 404.
+	notFoundRec := httptest.NewRecorder()
+	app.handleSession(notFoundRec, httptest.NewRequest(http.MethodDelete, "/sessions/"+convID, nil))
+	if notFoundRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 after session already closed, got %d", notFoundRec.Code)
+	}
 }

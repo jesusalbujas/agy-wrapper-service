@@ -311,16 +311,59 @@ func (app *application) handleModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"levels": []string{"low", "medium", "high"}, "models": models})
 }
 
+func (app *application) handleSession(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodDelete) {
+		return
+	}
+	conversationID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/sessions/"), "/")
+	if conversationID == "" || strings.Contains(conversationID, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	if !safeConversationID.MatchString(conversationID) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "conversation_id must be a UUID"})
+		return
+	}
+	if app.sessions == nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "No active session for this conversation_id"})
+		return
+	}
+	closed, err := app.sessions.closeSession(conversationID)
+	if err != nil {
+		writeJSON(w, agyErrorStatus(err), map[string]any{"error": err.Error()})
+		return
+	}
+	if !closed {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "No active session for this conversation_id"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"conversation_id": conversationID,
+		"closed":          true,
+	})
+}
+
 func (app *application) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
+	activeSessions := 0
+	if app.sessions != nil {
+		activeSessions = app.sessions.activeCount()
+	}
+	uptime := time.Since(app.startedAt)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":       "ok",
-		"defaultModel": app.defaultModel,
-		"defaultLevel": app.defaultLevel,
-		"workspace":    app.workspaceDir,
-		"uploadsDir":   app.uploadDir,
+		"status":             "ok",
+		"defaultModel":       app.defaultModel,
+		"defaultLevel":       app.defaultLevel,
+		"workspace":          app.workspaceDir,
+		"uploadsDir":         app.uploadDir,
+		"activeSessions":     activeSessions,
+		"maxSessions":        app.maxSessions,
+		"sessionIdleTimeout": app.sessionIdleTimeout.String(),
+		"uptimeSeconds":      int64(uptime.Seconds()),
+		"uptime":             uptime.Round(time.Second).String(),
+		"authEnabled":        app.apiKey != "",
 	})
 }
 
@@ -336,17 +379,19 @@ func (app *application) handleRoot(w http.ResponseWriter, r *http.Request) {
 		"status":  "running",
 		"service": "agy-cli-wrapper",
 		"endpoints": map[string]string{
-			"ask":     "POST /ask (body: { query, model?, level?, agent?, skills?, conversation_id?, title?, stream?, json? })",
-			"resume":  "POST /resume (body: { title?, conversation_id?, query? })",
-			"stream":  "GET|POST /ask/stream (query/body: { query, model?, level?, agent?, skills?, conversation_id? })",
-			"list":    "GET /conversations (query: { q?, limit? })",
-			"rename":  "PUT /conversations/{conversation_id}/name (body: { name })",
-			"askFile": "POST /ask-file (multipart \"file\" or body: { filePath, query })",
-			"models":  "GET /models",
-			"agents":  "GET /agents",
-			"plugins": "GET /plugins",
-			"skills":  "GET /skills",
-			"health":  "GET /health",
+			"ask":          "POST /ask (body: { query, model?, level?, agent?, skills?, conversation_id?, title?, stream?, json? })",
+			"resume":       "POST /resume (body: { title?, conversation_id?, query? })",
+			"stream":       "GET|POST /ask/stream (query/body: { query, model?, level?, agent?, skills?, conversation_id? })",
+			"list":         "GET /conversations (query: { q?, limit? })",
+			"conversation": "GET /conversations/{conversation_id} (query: { limit?, include_thinking?, include_tools? })",
+			"rename":       "PUT /conversations/{conversation_id}/name (body: { name })",
+			"closeSession": "DELETE /sessions/{conversation_id}",
+			"askFile":      "POST /ask-file (multipart \"file\" or body: { filePath, query })",
+			"models":       "GET /models",
+			"agents":       "GET /agents",
+			"plugins":      "GET /plugins",
+			"skills":       "GET /skills",
+			"health":       "GET /health",
 		},
 	})
 }

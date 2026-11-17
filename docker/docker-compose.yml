@@ -16,6 +16,9 @@ services:
       # Reuse the host's Antigravity configuration, auth scope, and session metadata
       - ${HOME}/.gemini:/home/agy/.gemini
       - ${HOME}/.config/antigravity:/home/agy/.config/antigravity
+      # Persist container-side file-based auth/cache across container rebuilds
+      - agy_local:/home/agy/.local
+      - agy_cache:/home/agy/.cache
       # Allow agy to access the host's unlocked Secret Service keyring
       - ${AGY_DBUS_SOCKET:-/run/user/1000/bus}:/run/agy/dbus-session
       # Persist uploaded files
@@ -29,3 +32,7 @@ services:
       HOME: /home/agy
       DBUS_SESSION_BUS_ADDRESS: unix:path=/run/agy/dbus-session
     restart: unless-stopped
+
+volumes:
+  agy_local:
+  agy_cache:

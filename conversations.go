@@ -272,6 +272,149 @@ func annotationTitle(content []byte) string {
 	return ""
 }
 
+type conversationMessage struct {
+	StepIndex int    `json:"step_index"`
+	Role      string `json:"role"`
+	Type      string `json:"type"`
+	Source    string `json:"source"`
+	Status    string `json:"status,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+	Content   string `json:"content,omitempty"`
+	Thinking  string `json:"thinking,omitempty"`
+	ToolCalls []any  `json:"tool_calls,omitempty"`
+}
+
+func (app *application) handleConversationRoutes(w http.ResponseWriter, r *http.Request) {
+	trimmedPath := strings.Trim(strings.TrimPrefix(r.URL.Path, "/conversations/"), "/")
+	parts := strings.Split(trimmedPath, "/")
+	if len(parts) == 1 && parts[0] != "" {
+		app.handleConversationDetail(w, r, parts[0])
+		return
+	}
+	if len(parts) == 2 && parts[1] == "name" {
+		app.handleConversationName(w, r)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func (app *application) handleConversationDetail(w http.ResponseWriter, r *http.Request, conversationID string) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	conversationID = strings.TrimSpace(conversationID)
+	if !safeConversationID.MatchString(conversationID) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "conversation_id must be a UUID"})
+		return
+	}
+	annotationPath := filepath.Join(app.geminiDir, "antigravity-cli", "annotations", conversationID+".pbtxt")
+	if !app.conversationExists(conversationID, annotationPath) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "Conversation not found"})
+		return
+	}
+
+	limit := 0
+	if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed < 1 || parsed > 500 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "limit must be between 1 and 500"})
+			return
+		}
+		limit = parsed
+	}
+	includeThinking := strings.EqualFold(r.URL.Query().Get("include_thinking"), "true")
+	includeTools := strings.EqualFold(r.URL.Query().Get("include_tools"), "true")
+
+	name := conversationID
+	if content, err := os.ReadFile(annotationPath); err == nil {
+		if title := annotationTitle(content); title != "" {
+			name = title
+		}
+	}
+
+	messages, err := app.readConversationMessages(conversationID, includeThinking, includeTools)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "Failed to read conversation transcript", "details": err.Error()})
+		return
+	}
+	if limit > 0 && len(messages) > limit {
+		messages = messages[len(messages)-limit:]
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"conversation_id": conversationID,
+		"name":            name,
+		"count":           len(messages),
+		"messages":        messages,
+	})
+}
+
+func (app *application) readConversationMessages(conversationID string, includeThinking, includeTools bool) ([]conversationMessage, error) {
+	file, err := os.Open(app.transcriptPath(conversationID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []conversationMessage{}, nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	messages := make([]conversationMessage, 0)
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), maxCommandOutput)
+	for scanner.Scan() {
+		var raw struct {
+			StepIndex int    `json:"step_index"`
+			Source    string `json:"source"`
+			Type      string `json:"type"`
+			Status    string `json:"status"`
+			CreatedAt string `json:"created_at"`
+			Content   string `json:"content"`
+			Thinking  string `json:"thinking"`
+			ToolCalls []any  `json:"tool_calls"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &raw) != nil {
+			continue
+		}
+		if !includeTools && strings.TrimSpace(raw.Content) == "" && (!includeThinking || strings.TrimSpace(raw.Thinking) == "") {
+			continue
+		}
+		role := strings.ToLower(raw.Source)
+		switch raw.Type {
+		case "USER_INPUT":
+			role = "user"
+		case "PLANNER_RESPONSE":
+			role = "assistant"
+		default:
+			if raw.Source == "MODEL" {
+				role = "assistant"
+			} else if raw.Source == "USER_EXPLICIT" {
+				role = "user"
+			}
+		}
+		msg := conversationMessage{
+			StepIndex: raw.StepIndex,
+			Role:      role,
+			Type:      raw.Type,
+			Source:    raw.Source,
+			Status:    raw.Status,
+			CreatedAt: raw.CreatedAt,
+			Content:   raw.Content,
+		}
+		if includeThinking {
+			msg.Thinking = raw.Thinking
+		}
+		if includeTools && len(raw.ToolCalls) > 0 {
+			msg.ToolCalls = raw.ToolCalls
+		}
+		messages = append(messages, msg)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
 func (app *application) handleConversationName(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut && r.Method != http.MethodPatch {
 		methodNotAllowed(w, http.MethodPut, http.MethodPatch)

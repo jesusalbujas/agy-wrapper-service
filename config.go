@@ -30,6 +30,9 @@ type application struct {
 	workspaceDir       string
 	uploadDir          string
 	geminiDir          string
+	apiKey             string
+	corsOrigins        []string
+	startedAt          time.Time
 	maxSessions        int
 	sessionIdleTimeout time.Duration
 	sessions           *agySessionManager
@@ -99,6 +102,15 @@ func newApplication() *application {
 			sessionIdleTimeout = parsed
 		}
 	}
+	apiKey := strings.TrimSpace(os.Getenv("API_KEY"))
+	var corsOrigins []string
+	if rawOrigins := strings.TrimSpace(os.Getenv("CORS_ORIGINS")); rawOrigins != "" {
+		for _, item := range strings.Split(rawOrigins, ",") {
+			if trimmed := strings.TrimSpace(item); trimmed != "" {
+				corsOrigins = append(corsOrigins, trimmed)
+			}
+		}
+	}
 	return &application{
 		port:               port,
 		defaultModel:       model,
@@ -107,6 +119,9 @@ func newApplication() *application {
 		workspaceDir:       workspaceDir,
 		uploadDir:          uploadDir,
 		geminiDir:          geminiDir,
+		apiKey:             apiKey,
+		corsOrigins:        corsOrigins,
+		startedAt:          time.Now(),
 		maxSessions:        maxSessions,
 		sessionIdleTimeout: sessionIdleTimeout,
 	}

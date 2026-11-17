@@ -209,6 +209,30 @@ func (manager *agySessionManager) closeIdleSessions() {
 	manager.mu.Unlock()
 }
 
+func (manager *agySessionManager) activeCount() int {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	return len(manager.sessions)
+}
+
+func (manager *agySessionManager) closeSession(conversationID string) (bool, error) {
+	manager.mu.Lock()
+	session, ok := manager.sessions[conversationID]
+	if !ok {
+		manager.mu.Unlock()
+		return false, nil
+	}
+	if !session.mu.TryLock() {
+		manager.mu.Unlock()
+		return false, errAgySessionBusy
+	}
+	delete(manager.sessions, conversationID)
+	manager.mu.Unlock()
+	session.stopLocked()
+	session.mu.Unlock()
+	return true, nil
+}
+
 func (manager *agySessionManager) closeAll() {
 	manager.mu.Lock()
 	sessions := make([]*agySession, 0, len(manager.sessions))

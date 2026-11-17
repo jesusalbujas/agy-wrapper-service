@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -27,7 +29,8 @@ func main() {
 	mux.HandleFunc("/ask/stream", app.handleStream)
 	mux.HandleFunc("/ask-file", app.handleAskFile)
 	mux.HandleFunc("/conversations", app.handleConversationList)
-	mux.HandleFunc("/conversations/", app.handleConversationName)
+	mux.HandleFunc("/conversations/", app.handleConversationRoutes)
+	mux.HandleFunc("/sessions/", app.handleSession)
 	mux.HandleFunc("/models", app.handleModels)
 	mux.HandleFunc("/agents", app.handleAgents)
 	mux.HandleFunc("/plugins", app.handlePlugins)
@@ -37,7 +40,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              ":" + app.port,
-		Handler:           logRequests(mux),
+		Handler:           logRequests(withCORS(app, withAuth(app, mux))),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    1 << 20,
@@ -75,5 +78,59 @@ func logRequests(next http.Handler) http.Handler {
 		started := time.Now()
 		next.ServeHTTP(w, r)
 		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(started).Round(time.Millisecond))
+	})
+}
+
+func withCORS(app *application, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(app.corsOrigins) > 0 {
+			origin := r.Header.Get("Origin")
+			allowedOrigin := ""
+			for _, candidate := range app.corsOrigins {
+				if candidate == "*" {
+					allowedOrigin = "*"
+					break
+				}
+				if origin != "" && strings.EqualFold(candidate, origin) {
+					allowedOrigin = origin
+					break
+				}
+			}
+			if allowedOrigin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+				if allowedOrigin != "*" {
+					w.Header().Add("Vary", "Origin")
+				}
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, Accept")
+				w.Header().Set("Access-Control-Expose-Headers", "X-Conversation-Id, X-Conversation-Title, X-Conversation-Name-Error")
+			}
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func withAuth(app *application, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if app.apiKey == "" || r.URL.Path == "/health" || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		token := strings.TrimSpace(r.Header.Get("X-API-Key"))
+		if token == "" {
+			authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+			if len(authHeader) > 7 && strings.EqualFold(authHeader[:7], "Bearer ") {
+				token = strings.TrimSpace(authHeader[7:])
+			}
+		}
+		if subtle.ConstantTimeCompare([]byte(token), []byte(app.apiKey)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "Unauthorized"})
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
