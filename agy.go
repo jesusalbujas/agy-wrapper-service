@@ -32,12 +32,18 @@ func (app *application) resolveOptions(body map[string]any, query map[string][]s
 		}
 	}
 	conversationID := firstNonEmpty(stringValue(body["conversation_id"]), stringValue(body["conversation"]), getQuery("conversation_id"))
+	title := firstNonEmpty(stringValue(body["title"]), stringValue(body["name"]), getQuery("title"), getQuery("name"))
+	agent := firstNonEmpty(stringValue(body["agent"]), getQuery("agent"))
+	skills := parseSkills(body["skills"], body["skill"], getQuery("skills"), getQuery("skill"))
 	return requestOptions{
 		Model:          model,
 		Effort:         effort,
-		WorkspaceDir:   firstNonEmpty(stringValue(body["workspaceDir"]), defaultWorkspace),
+		Agent:          strings.TrimSpace(agent),
+		Skills:         skills,
+		WorkspaceDir:   firstNonEmpty(stringValue(body["workspaceDir"]), app.workspaceDir),
 		Continue:       boolValue(body["continue"]) || boolValue(body["c"]) || getQuery("continue") == "true",
 		ConversationID: conversationID,
+		Title:          strings.TrimSpace(title),
 	}
 }
 
@@ -57,11 +63,14 @@ func normalizeLevel(level string) string {
 }
 
 func (app *application) executeAgy(ctx context.Context, query string, opts requestOptions) (commandResult, error) {
-	result, nativeErr := app.runAgyTurn(ctx, query, opts, nil)
+	result, nativeErr := app.runAgyTurn(ctx, applySkills(query, opts.Skills), opts, nil)
 	if nativeErr == nil {
 		return result, nil
 	}
-	return app.fallbackIfAgyMissing(ctx, query, opts, nativeErr)
+	if errors.Is(nativeErr, exec.ErrNotFound) {
+		return app.fallbackIfAgyMissing(ctx, query, opts, nativeErr)
+	}
+	return result, nativeErr
 }
 
 func (app *application) runCompanionFallback(ctx context.Context, query string, opts requestOptions) (commandResult, error) {
@@ -93,6 +102,19 @@ func (app *application) formatResponse(w http.ResponseWriter, r *http.Request, b
 	if result.Meta != nil {
 		conversationID = stringValue(result.Meta["conversation_id"])
 	}
+	var titleError string
+	if opts.Title != "" && conversationID != "" {
+		if err := app.renameConversation(conversationID, opts.Title); err != nil {
+			titleError = err.Error()
+			log.Printf("rename conversation %s after /ask: %v", conversationID, err)
+			w.Header().Set("X-Conversation-Name-Error", titleError)
+		} else {
+			w.Header().Set("X-Conversation-Title", opts.Title)
+		}
+	} else if opts.Title != "" {
+		titleError = "Antigravity did not return a conversation ID; the name was not applied"
+		w.Header().Set("X-Conversation-Name-Error", titleError)
+	}
 	if conversationID != "" {
 		w.Header().Set("X-Conversation-Id", conversationID)
 	}
@@ -105,14 +127,28 @@ func (app *application) formatResponse(w http.ResponseWriter, r *http.Request, b
 	}
 	wantsJSON := boolValue(body["json"]) || r.URL.Query().Get("json") == "true" || strings.Contains(r.Header.Get("Accept"), "application/json")
 	if wantsJSON {
-		writeJSON(w, http.StatusOK, map[string]any{"response": result.Response, "thinking": result.Thinking, "tools": result.Tools, "conversation_id": nullableString(conversationID)})
+		payload := map[string]any{"response": result.Response, "thinking": result.Thinking, "tools": result.Tools, "conversation_id": nullableString(conversationID)}
+		if opts.Title != "" {
+			payload["conversation_name"] = opts.Title
+			if titleError != "" {
+				payload["conversation_name_error"] = titleError
+			}
+		}
+		writeJSON(w, http.StatusOK, payload)
 		return
 	}
 	if boolValue(body["full"]) || r.URL.Query().Get("full") == "true" {
-		writeJSON(w, http.StatusOK, map[string]any{
+		payload := map[string]any{
 			"success": true, "response": result.Response, "thinking": result.Thinking, "tools": result.Tools,
 			"model": opts.Model, "level": nullableString(opts.Effort), "conversation_id": nullableString(conversationID), "meta": result.Meta,
-		})
+		}
+		if opts.Title != "" {
+			payload["conversation_name"] = opts.Title
+			if titleError != "" {
+				payload["conversation_name_error"] = titleError
+			}
+		}
+		writeJSON(w, http.StatusOK, payload)
 		return
 	}
 	response := result.Response
@@ -132,6 +168,9 @@ func (app *application) streamAgy(w http.ResponseWriter, r *http.Request, query 
 		w.Header().Set("Connection", "keep-alive")
 	} else {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	}
+	if opts.Title != "" {
+		w.Header().Set("X-Conversation-Title", opts.Title)
 	}
 
 	flush := func() {
@@ -159,12 +198,21 @@ func (app *application) streamAgy(w http.ResponseWriter, r *http.Request, query 
 	if conversationID != "" {
 		w.Header().Set("X-Conversation-Id", conversationID)
 	}
+	emittedConversationID := false
 	onEvent := func(event map[string]any) error {
 		switch stringValue(event["event"]) {
 		case "init":
 			if id := stringValue(event["conversation_id"]); id != "" {
 				conversationID = id
-				w.Header().Set("X-Conversation-Id", id)
+				if !wroteResponse {
+					w.Header().Set("X-Conversation-Id", id)
+				}
+				if isSSE && !emittedConversationID {
+					if !writeSSE(map[string]any{"type": "conversation", "conversation_id": id}) {
+						return io.ErrClosedPipe
+					}
+					emittedConversationID = true
+				}
 			}
 		case "step_update":
 			step, _ := event["step_update"].(map[string]any)
@@ -206,9 +254,9 @@ func (app *application) streamAgy(w http.ResponseWriter, r *http.Request, query 
 		return nil
 	}
 
-	result, err := app.runAgyTurn(r.Context(), query, opts, onEvent)
+	result, err := app.runAgyTurn(r.Context(), applySkills(query, opts.Skills), opts, onEvent)
 	if errors.Is(err, exec.ErrNotFound) {
-		result, err = app.runCompanionFallback(r.Context(), query, opts)
+		result, err = app.runCompanionFallback(r.Context(), applySkills(query, opts.Skills), opts)
 	}
 	if err != nil {
 		if wroteResponse {
@@ -225,7 +273,34 @@ func (app *application) streamAgy(w http.ResponseWriter, r *http.Request, query 
 	if result.Meta != nil {
 		if id := stringValue(result.Meta["conversation_id"]); id != "" {
 			conversationID = id
-			w.Header().Set("X-Conversation-Id", id)
+			if !wroteResponse {
+				w.Header().Set("X-Conversation-Id", id)
+			}
+		}
+	}
+	var titleError string
+	if opts.Title != "" && conversationID != "" {
+		if err := app.renameConversation(conversationID, opts.Title); err != nil {
+			titleError = err.Error()
+			log.Printf("rename conversation %s after stream: %v", conversationID, err)
+		} else if isSSE {
+			if !writeSSE(map[string]any{"type": "conversation", "conversation_id": conversationID, "name": opts.Title}) {
+				return
+			}
+			emittedConversationID = true
+		}
+	} else if opts.Title != "" {
+		titleError = "Antigravity did not return a conversation ID; the name was not applied"
+	}
+	if isSSE && conversationID != "" && !emittedConversationID {
+		if !writeSSE(map[string]any{"type": "conversation", "conversation_id": conversationID}) {
+			return
+		}
+		emittedConversationID = true
+	}
+	if titleError != "" && isSSE {
+		if !writeSSE(map[string]any{"type": "conversation_name_error", "conversation_id": conversationID, "error": titleError}) {
+			return
 		}
 	}
 	if !wroteResponse && result.Response != "" {

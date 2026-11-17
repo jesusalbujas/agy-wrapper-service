@@ -23,9 +23,15 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ask", app.handleAsk)
+	mux.HandleFunc("/resume", app.handleResume)
 	mux.HandleFunc("/ask/stream", app.handleStream)
 	mux.HandleFunc("/ask-file", app.handleAskFile)
+	mux.HandleFunc("/conversations", app.handleConversationList)
+	mux.HandleFunc("/conversations/", app.handleConversationName)
 	mux.HandleFunc("/models", app.handleModels)
+	mux.HandleFunc("/agents", app.handleAgents)
+	mux.HandleFunc("/plugins", app.handlePlugins)
+	mux.HandleFunc("/skills", app.handleSkills)
 	mux.HandleFunc("/health", app.handleHealth)
 	mux.HandleFunc("/", app.handleRoot)
 

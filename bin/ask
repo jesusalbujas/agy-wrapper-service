@@ -15,6 +15,9 @@ fi
 API_BASE="${AGY_API_URL:-${API_BASE:-http://localhost:3000}}"
 MODEL=""
 LEVEL=""
+AGENT=""
+SKILLS=()
+RESUME_CONVERSATION_ID=""
 STREAM=false
 CONTINUE=false
 SHOW_THINKING=${ASK_SHOW_THINKING:-false}
@@ -366,12 +369,19 @@ Commands:
   url                    Show the currently configured server URL
   logout                 Sign out of Google/Antigravity
   models                 List models and effort levels available through the API
+  agents                 List available Antigravity agents
+  plugins                List installed Antigravity plugins
+  skills                 List installed Antigravity skills
 
 Options:
   -c, --continue         Continue the most recent conversation (preserve context)
+  --conversation <id>    Resume a specific conversation ID
+  --resume <id>          Alias for --conversation
   -t, --thinking         Show model thinking in the stream
   -m, --model <model>   Model to use (for example, claude-sonnet-4-6)
   -l, --level <level>    Reasoning effort (low, medium, high)
+  --agent <name>         Use an installed Antigravity agent
+  --skill <name>         Invoke an installed skill (repeatable)
   -s, --stream           Stream the response as it is generated
   -j, --json             Return the response as JSON
   -r, --raw              Show raw text without formatting or animation
@@ -387,6 +397,9 @@ Examples:
   ask -t "what is the best way to structure a web application?"
   ask -s explain microservices in three points
   ask -c "now explain point 2 with a Node.js example"
+  ask --conversation 183f46ca-27ea-432d-892c-664dff41df5c "continue that analysis"
+  ask --agent firestore-rules-author "Review these Firestore rules"
+  ask --skill chrome-devtools "Inspect this page for accessibility issues"
   ask -m claude-sonnet-4-6 -l high "What is an ACID transaction?"
   cat error.log | ask "Explain why this failed"
   git diff | ask "Write a conventional commit message"
@@ -425,6 +438,12 @@ case "$1" in
         shift
         list_models
         ;;
+    agents|plugins|skills)
+        command="$1"
+        curl -sS "${API_BASE}/${command}" | jq . 2>/dev/null || curl -sS "${API_BASE}/${command}"
+        echo ""
+        exit 0
+        ;;
 esac
 
 # Parse standard arguments and options
@@ -440,6 +459,10 @@ while [[ $# -gt 0 ]]; do
             CONTINUE=true
             shift
             ;;
+        --conversation|--resume)
+            RESUME_CONVERSATION_ID="$2"
+            shift 2
+            ;;
         -t|--thinking)
             SHOW_THINKING=true
             if [ "$JSON_OUTPUT" != true ]; then
@@ -453,6 +476,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         -l|--level)
             LEVEL="$2"
+            shift 2
+            ;;
+        --agent)
+            AGENT="$2"
+            shift 2
+            ;;
+        --skill)
+            SKILLS+=("$2")
             shift 2
             ;;
         -s|--stream)
@@ -513,7 +544,20 @@ if [ -z "$QUERY" ]; then
 fi
 
 if [ "$CONTINUE" = true ] && [ -z "$SAVED_CONVERSATION_ID" ]; then
-    echo "Error: No saved conversation exists for this API URL. Start a conversation first, then use -c." >&2
+    if [ -n "$RESUME_CONVERSATION_ID" ]; then
+        SAVED_CONVERSATION_ID="$RESUME_CONVERSATION_ID"
+    else
+        echo "Error: No saved conversation exists for this API URL. Start a conversation first, then use -c." >&2
+        exit 1
+    fi
+fi
+
+if [ -n "$RESUME_CONVERSATION_ID" ]; then
+    SAVED_CONVERSATION_ID="$RESUME_CONVERSATION_ID"
+fi
+
+if [ "$CONTINUE" = true ] && [ -z "$SAVED_CONVERSATION_ID" ]; then
+    echo "Error: Specify a conversation ID with --conversation or start one before using -c." >&2
     exit 1
 fi
 
@@ -614,18 +658,26 @@ finally:
 # Build the JSON payload with jq or Python 3
 PAYLOAD=""
 if command -v jq >/dev/null 2>&1; then
+    if ((${#SKILLS[@]})); then
+        SKILLS_JSON=$(printf '%s\n' "${SKILLS[@]}" | jq -R . | jq -s .)
+    else
+        SKILLS_JSON='[]'
+    fi
     PAYLOAD=$(jq -n \
         --arg q "$QUERY" \
         --arg m "$MODEL" \
         --arg l "$LEVEL" \
+        --arg a "$AGENT" \
         --arg cid "$SAVED_CONVERSATION_ID" \
+        --argjson skills "$SKILLS_JSON" \
         --argjson s "$STREAM" \
         --argjson c "$CONTINUE" \
         --argjson t "$SHOW_THINKING" \
         --argjson j "$JSON_OUTPUT" \
-        '{query: $q} + (if $m != "" then {model: $m} else {} end) + (if $l != "" then {level: $l} else {} end) + (if $s then {stream: true} else {} end) + (if $c and $cid != "" then {conversation_id: $cid} elif $c then {continue: true} else {} end) + (if $t then {thinking: true} else {} end) + (if $j then {json: true} else {} end)')
+        '{query: $q} + (if $m != "" then {model: $m} else {} end) + (if $l != "" then {level: $l} else {} end) + (if $a != "" then {agent: $a} else {} end) + (if ($skills | length) > 0 then {skills: $skills} else {} end) + (if $s then {stream: true} else {} end) + (if $cid != "" then {conversation_id: $cid} elif $c then {continue: true} else {} end) + (if $t then {thinking: true} else {} end) + (if $j then {json: true} else {} end)')
 else
-    PAYLOAD=$(python3 -c 'import json, sys; p={"query":sys.argv[1],"model":sys.argv[2] or None,"level":sys.argv[3] or None,"stream":sys.argv[4]=="true","thinking":sys.argv[6]=="true","json":sys.argv[7]=="true"}; p.update(({"conversation_id":sys.argv[8]} if sys.argv[5]=="true" and sys.argv[8] else ({"continue":True} if sys.argv[5]=="true" else {}))); print(json.dumps(p))' "$QUERY" "$MODEL" "$LEVEL" "$STREAM" "$CONTINUE" "$SHOW_THINKING" "$JSON_OUTPUT" "$SAVED_CONVERSATION_ID")
+    SKILLS_JSON=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${SKILLS[@]}")
+    PAYLOAD=$(python3 -c 'import json,sys; p={"query":sys.argv[1],"model":sys.argv[2] or None,"level":sys.argv[3] or None,"stream":sys.argv[4]=="true","thinking":sys.argv[7]=="true","json":sys.argv[8]=="true"}; p.update(({"agent":sys.argv[5]} if sys.argv[5] else {})); skills=json.loads(sys.argv[6]); p.update(({"skills":skills} if skills else {})); p.update(({"conversation_id":sys.argv[9]} if sys.argv[9] else ({"continue":True} if sys.argv[10]=="true" else {}))); print(json.dumps(p))' "$QUERY" "$MODEL" "$LEVEL" "$STREAM" "$AGENT" "$SKILLS_JSON" "$SHOW_THINKING" "$JSON_OUTPUT" "$SAVED_CONVERSATION_ID" "$CONTINUE")
 fi
 
 ENDPOINT="${API_BASE}/ask"

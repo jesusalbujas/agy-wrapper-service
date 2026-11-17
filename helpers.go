@@ -11,6 +11,14 @@ import (
 	"strings"
 )
 
+type upstreamAPIError struct {
+	message string
+}
+
+func (err *upstreamAPIError) Error() string {
+	return err.message
+}
+
 func decodeJSONBody(w http.ResponseWriter, r *http.Request) (map[string]any, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 	var body map[string]any
@@ -58,6 +66,10 @@ func wantsThinking(r *http.Request, body map[string]any) bool {
 }
 
 func agyErrorStatus(err error) int {
+	var upstreamErr *upstreamAPIError
+	if errors.As(err, &upstreamErr) {
+		return http.StatusBadGateway
+	}
 	switch {
 	case errors.Is(err, errAgySessionBusy):
 		return http.StatusConflict
@@ -72,7 +84,74 @@ func validateAgyOptions(opts requestOptions) error {
 	if opts.Continue && opts.ConversationID == "" {
 		return errors.New("continuing a conversation requires its conversation_id")
 	}
+	if opts.ConversationID != "" && !safeConversationID.MatchString(opts.ConversationID) {
+		return errors.New("conversation_id must be a UUID")
+	}
+	if opts.Title != "" {
+		if err := validateConversationTitle(opts.Title); err != nil {
+			return err
+		}
+	}
+	if opts.Agent != "" && !safeCapabilityName.MatchString(opts.Agent) {
+		return errors.New("agent must be a valid Antigravity agent name")
+	}
+	if len(opts.Skills) > 10 {
+		return errors.New("a request can invoke at most 10 skills")
+	}
+	for _, skill := range opts.Skills {
+		if !safeCapabilityName.MatchString(skill) {
+			return errors.New("skills must be valid Antigravity skill names")
+		}
+	}
 	return nil
+}
+
+func parseSkills(values ...any) []string {
+	seen := make(map[string]struct{})
+	skills := make([]string, 0)
+	var add func(any)
+	add = func(value any) {
+		switch typed := value.(type) {
+		case []any:
+			for _, item := range typed {
+				add(item)
+			}
+		case []string:
+			for _, item := range typed {
+				add(item)
+			}
+		case string:
+			for _, item := range strings.Split(typed, ",") {
+				name := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(item), "/"))
+				if name == "" || !safeCapabilityName.MatchString(name) {
+					continue
+				}
+				if _, exists := seen[name]; exists {
+					continue
+				}
+				seen[name] = struct{}{}
+				skills = append(skills, name)
+			}
+		}
+	}
+	for _, value := range values {
+		add(value)
+	}
+	return skills
+}
+
+func applySkills(prompt string, skills []string) string {
+	if len(skills) == 0 {
+		return prompt
+	}
+	var prefix strings.Builder
+	for _, skill := range skills {
+		prefix.WriteByte('/')
+		prefix.WriteString(skill)
+		prefix.WriteByte('\n')
+	}
+	prefix.WriteString(prompt)
+	return prefix.String()
 }
 
 func stringValue(value any) string {

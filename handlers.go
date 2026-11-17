@@ -87,7 +87,7 @@ func (app *application) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet {
-		opts.WorkspaceDir = defaultWorkspace
+		opts.WorkspaceDir = app.workspaceDir
 	}
 	app.streamAgy(w, r, query, opts, boolValue(body["sse"]), wantsThinking(r, body))
 }
@@ -97,7 +97,7 @@ func (app *application) handleAskFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBodyBytes)
-	body, filePath, originalName, cleanup, err := parseFileRequest(w, r, app.uploadDir)
+	body, filePath, originalName, cleanup, err := parseFileRequest(w, r, app.workspaceDir, app.uploadDir)
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -118,7 +118,7 @@ func (app *application) handleAskFile(w http.ResponseWriter, r *http.Request) {
 		instruction = "Analyze this file in detail, explain what it does, and highlight potential issues or improvements."
 	}
 	opts := app.resolveOptions(body, r.URL.Query())
-	opts.WorkspaceDir = defaultWorkspace
+	opts.WorkspaceDir = app.workspaceDir
 	if err := validateAgyOptions(opts); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
@@ -139,20 +139,29 @@ func (app *application) handleAskFile(w http.ResponseWriter, r *http.Request) {
 	app.formatResponse(w, r, body, result, opts)
 }
 
-func parseFileRequest(w http.ResponseWriter, r *http.Request, uploadDir string) (map[string]any, string, string, func(), error) {
+func parseFileRequest(w http.ResponseWriter, r *http.Request, workspaceDir, uploadDir string) (map[string]any, string, string, func(), error) {
 	body := make(map[string]any)
 	contentType := r.Header.Get("Content-Type")
 	var cleanup func()
 	var targetPath, originalName string
+	addCleanup := func(fn func()) {
+		prev := cleanup
+		cleanup = func() {
+			fn()
+			if prev != nil {
+				prev()
+			}
+		}
+	}
 
 	if strings.HasPrefix(contentType, "multipart/form-data") {
 		if err := r.ParseMultipartForm(32 << 20); err != nil {
 			return nil, "", "", nil, fmt.Errorf("invalid multipart form: %w", err)
 		}
 		if r.MultipartForm != nil {
-			cleanup = func() { _ = r.MultipartForm.RemoveAll() }
+			addCleanup(func() { _ = r.MultipartForm.RemoveAll() })
 		}
-		for _, key := range []string{"query", "instruction", "filePath", "model", "level", "effort", "stream", "json", "full", "thinking", "workspaceDir", "conversation_id", "conversation", "continue", "c"} {
+		for _, key := range []string{"query", "instruction", "filePath", "model", "level", "effort", "agent", "skill", "skills", "stream", "json", "full", "thinking", "workspaceDir", "conversation_id", "conversation", "continue", "c", "title", "name"} {
 			if value := r.FormValue(key); value != "" {
 				body[key] = value
 			}
@@ -176,6 +185,7 @@ func parseFileRequest(w http.ResponseWriter, r *http.Request, uploadDir string) 
 				os.Remove(targetPath)
 				return nil, "", "", cleanup, fmt.Errorf("save uploaded file: %w", closeErr)
 			}
+			addCleanup(func() { _ = os.Remove(targetPath) })
 		} else if !errors.Is(err, http.ErrMissingFile) {
 			return nil, "", "", cleanup, fmt.Errorf("read uploaded file: %w", err)
 		}
@@ -207,8 +217,22 @@ func parseFileRequest(w http.ResponseWriter, r *http.Request, uploadDir string) 
 		return nil, "", "", nil, errors.New(`Attach a file ("file") or specify an existing path ("filePath")`)
 	}
 	if !filepath.IsAbs(requestedPath) {
-		requestedPath = filepath.Join(defaultWorkspace, requestedPath)
+		requestedPath = filepath.Join(workspaceDir, requestedPath)
 	}
+	absRequested, err := filepath.Abs(requestedPath)
+	if err != nil {
+		if cleanup != nil {
+			cleanup()
+		}
+		return nil, "", "", nil, fmt.Errorf("invalid filePath: %w", err)
+	}
+	if !isWithinDir(absRequested, workspaceDir) && !isWithinDir(absRequested, uploadDir) {
+		if cleanup != nil {
+			cleanup()
+		}
+		return nil, "", "", nil, errors.New("filePath must be within the workspace or uploads directory")
+	}
+	requestedPath = absRequested
 	info, err := os.Stat(requestedPath)
 	if err != nil {
 		if cleanup != nil {
@@ -222,7 +246,37 @@ func parseFileRequest(w http.ResponseWriter, r *http.Request, uploadDir string) 
 	if info.IsDir() {
 		return nil, "", "", cleanup, fmt.Errorf("File path is a directory: %s", requestedPath)
 	}
+	if resolved, err := filepath.EvalSymlinks(requestedPath); err == nil {
+		if !isWithinDir(resolved, workspaceDir) && !isWithinDir(resolved, uploadDir) {
+			return nil, "", "", cleanup, errors.New("filePath must be within the workspace or uploads directory")
+		}
+	}
 	return body, requestedPath, filepath.Base(requestedPath), cleanup, nil
+}
+
+func isWithinDir(targetPath, baseDir string) bool {
+	if strings.TrimSpace(baseDir) == "" {
+		return false
+	}
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return false
+	}
+	if resolvedBase, err := filepath.EvalSymlinks(absBase); err == nil {
+		absBase = resolvedBase
+	}
+	absTarget, err := filepath.Abs(targetPath)
+	if err != nil {
+		return false
+	}
+	if resolvedTarget, err := filepath.EvalSymlinks(absTarget); err == nil {
+		absTarget = resolvedTarget
+	}
+	rel, err := filepath.Rel(absBase, absTarget)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func (app *application) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -265,7 +319,7 @@ func (app *application) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":       "ok",
 		"defaultModel": app.defaultModel,
 		"defaultLevel": app.defaultLevel,
-		"workspace":    defaultWorkspace,
+		"workspace":    app.workspaceDir,
 		"uploadsDir":   app.uploadDir,
 	})
 }
@@ -282,10 +336,16 @@ func (app *application) handleRoot(w http.ResponseWriter, r *http.Request) {
 		"status":  "running",
 		"service": "agy-cli-wrapper",
 		"endpoints": map[string]string{
-			"ask":     "POST /ask (body: { query, model?, level?, stream?, json? })",
-			"stream":  "GET|POST /ask/stream (query/body: { query, model?, level? })",
+			"ask":     "POST /ask (body: { query, model?, level?, agent?, skills?, conversation_id?, title?, stream?, json? })",
+			"resume":  "POST /resume (body: { title?, conversation_id?, query? })",
+			"stream":  "GET|POST /ask/stream (query/body: { query, model?, level?, agent?, skills?, conversation_id? })",
+			"list":    "GET /conversations (query: { q?, limit? })",
+			"rename":  "PUT /conversations/{conversation_id}/name (body: { name })",
 			"askFile": "POST /ask-file (multipart \"file\" or body: { filePath, query })",
 			"models":  "GET /models",
+			"agents":  "GET /agents",
+			"plugins": "GET /plugins",
+			"skills":  "GET /skills",
 			"health":  "GET /health",
 		},
 	})

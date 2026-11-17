@@ -3,18 +3,29 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:
+        AGY_UID: ${AGY_UID:-1000}
+        AGY_GID: ${AGY_GID:-1000}
     container_name: agy-api-wrapper
+    user: "${AGY_UID:-1000}:${AGY_GID:-1000}"
+    security_opt:
+      - apparmor:unconfined
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
     volumes:
-      # Reuse the host's Antigravity authentication session
-      - ${HOME}/.gemini:/root/.gemini
+      # Reuse the host's Antigravity configuration, auth scope, and session metadata
+      - ${HOME}/.gemini:/home/agy/.gemini
+      - ${HOME}/.config/antigravity:/home/agy/.config/antigravity
+      # Allow agy to access the host's unlocked Secret Service keyring
+      - ${AGY_DBUS_SOCKET:-/run/user/1000/bus}:/run/agy/dbus-session
       # Persist uploaded files
-      - ../uploads:/app/uploads
+      - ${AGY_UPLOADS_HOST_DIR:-../uploads}:/app/uploads
     env_file:
       - ../.env
     environment:
       PORT: ${PORT:-3000}
       UPLOAD_DIR: ${UPLOAD_DIR:-/app/uploads}
-      AGY_PATH: ${AGY_PATH:-/root/.local/bin/agy}
+      AGY_PATH: ${AGY_PATH:-/usr/local/bin/agy}
+      HOME: /home/agy
+      DBUS_SESSION_BUS_ADDRESS: unix:path=/run/agy/dbus-session
     restart: unless-stopped

@@ -104,7 +104,15 @@ func (manager *agySessionManager) acquire(conversationID string, opts requestOpt
 }
 
 func sessionOptionsMatch(left, right requestOptions) bool {
-	return left.Model == right.Model && left.Effort == right.Effort && left.WorkspaceDir == right.WorkspaceDir
+	if left.Model != right.Model || left.Effort != right.Effort || left.Agent != right.Agent || left.WorkspaceDir != right.WorkspaceDir || len(left.Skills) != len(right.Skills) {
+		return false
+	}
+	for index := range left.Skills {
+		if left.Skills[index] != right.Skills[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (manager *agySessionManager) evictOldestIdleLocked() bool {
@@ -317,7 +325,11 @@ func (session *agySession) runTurn(ctx context.Context, prompt string, onEvent f
 				}
 				status := stringValue(payload["status"])
 				if status != "" && status != "SUCCESS" {
-					return result, fmt.Errorf("Antigravity returned status %s: %s", status, stringValue(payload["error"]))
+					message := fmt.Sprintf("Antigravity returned status %s: %s", status, stringValue(payload["error"]))
+					if strings.Contains(strings.ToLower(message), "api error") || strings.Contains(strings.ToLower(message), "request failed") {
+						return result, &upstreamAPIError{message: message}
+					}
+					return result, errors.New(message)
 				}
 				return result, nil
 			}
@@ -345,6 +357,9 @@ func (session *agySession) start() error {
 	}
 	if session.opts.Effort != "" {
 		args = append(args, "--effort", session.opts.Effort)
+	}
+	if session.opts.Agent != "" {
+		args = append(args, "--agent", session.opts.Agent)
 	}
 
 	cmd := exec.Command(session.manager.app.agyPath, args...)

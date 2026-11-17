@@ -7,37 +7,44 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
 	defaultModel       = "gemini-3.8-flash"
-	defaultWorkspace   = "/app"
 	maxJSONBodyBytes   = 10 << 20
 	maxUploadBodyBytes = 100 << 20
 	maxCommandOutput   = 20 << 20
 )
 
 var safeFilename = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
+var safeCapabilityName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$`)
+var safeConversationID = regexp.MustCompile(`^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$`)
 
 type application struct {
 	port               string
 	defaultModel       string
 	defaultLevel       string
 	agyPath            string
+	workspaceDir       string
 	uploadDir          string
 	geminiDir          string
 	maxSessions        int
 	sessionIdleTimeout time.Duration
 	sessions           *agySessionManager
+	annotationMu       sync.Mutex
 }
 
 type requestOptions struct {
 	Model          string
 	Effort         string
+	Agent          string
+	Skills         []string
 	WorkspaceDir   string
 	Continue       bool
 	ConversationID string
+	Title          string
 }
 
 type commandResult struct {
@@ -58,9 +65,22 @@ func newApplication() *application {
 		level = "medium"
 	}
 	home := envOr("HOME", "/root")
+	workspaceDir := envOr("WORKSPACE_DIR", "")
+	if workspaceDir == "" {
+		if _, err := os.Stat("/app"); err == nil {
+			workspaceDir = "/app"
+		} else if cwd, err := os.Getwd(); err == nil {
+			workspaceDir = cwd
+		} else {
+			workspaceDir = "."
+		}
+	}
+	if absWorkspace, err := filepath.Abs(workspaceDir); err == nil {
+		workspaceDir = absWorkspace
+	}
 	uploadDir := envOr("UPLOAD_DIR", filepath.Join("uploads"))
 	if !filepath.IsAbs(uploadDir) {
-		uploadDir = filepath.Join("/app", uploadDir)
+		uploadDir = filepath.Join(workspaceDir, uploadDir)
 	}
 	geminiDir := envOr("GEMINI_DIR", filepath.Join(home, ".gemini"))
 	agyPath := envOr("AGY_PATH", "/root/.local/bin/agy")
@@ -84,6 +104,7 @@ func newApplication() *application {
 		defaultModel:       model,
 		defaultLevel:       level,
 		agyPath:            agyPath,
+		workspaceDir:       workspaceDir,
 		uploadDir:          uploadDir,
 		geminiDir:          geminiDir,
 		maxSessions:        maxSessions,
